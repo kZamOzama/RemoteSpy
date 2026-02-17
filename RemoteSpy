@@ -1,0 +1,1660 @@
+-- Holy Organize les goo
+
+
+--------------------------------------------------------------------------------
+-- SERVICES
+--------------------------------------------------------------------------------
+local HttpService        = game:GetService("HttpService")
+local Players            = game:GetService("Players")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local RunService         = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+
+--------------------------------------------------------------------------------
+-- CONSTANTS
+--------------------------------------------------------------------------------
+local VERSION          = "5.0"
+local MAX_HISTORY      = 500
+local DEDUPE_WINDOW    = 0.35
+local FIRE_RATE_LIMIT  = 0.2
+local SCROLL_THRESH    = 80
+local MAX_EXEC_LOG     = 20
+
+--------------------------------------------------------------------------------
+-- THEME
+--------------------------------------------------------------------------------
+local T = {
+    -- Backgrounds
+    BG           = Color3.fromRGB(12, 12, 14),
+    BG2          = Color3.fromRGB(18, 18, 22),
+    BG3          = Color3.fromRGB(24, 24, 30),
+    BG4          = Color3.fromRGB(30, 30, 38),
+    -- Borders
+    BORDER       = Color3.fromRGB(45, 45, 58),
+    BORDER2      = Color3.fromRGB(60, 60, 78),
+    -- Accents
+    GREEN        = Color3.fromRGB(50, 210, 100),
+    GREEN_DIM    = Color3.fromRGB(30, 140, 65),
+    GREEN_TINT   = Color3.fromRGB(18, 45, 25),
+    BLUE         = Color3.fromRGB(60, 140, 255),
+    BLUE_DIM     = Color3.fromRGB(35, 80, 180),
+    BLUE_TINT    = Color3.fromRGB(18, 30, 65),
+    YELLOW       = Color3.fromRGB(255, 200, 60),
+    RED          = Color3.fromRGB(220, 60, 60),
+    PURPLE       = Color3.fromRGB(160, 80, 255),
+    ORANGE       = Color3.fromRGB(220, 130, 30),
+    -- Text
+    TEXT         = Color3.fromRGB(210, 215, 225),
+    TEXT_DIM     = Color3.fromRGB(130, 135, 150),
+    TEXT_MUTED   = Color3.fromRGB(75, 78, 95),
+    CODE         = Color3.fromRGB(100, 255, 140),
+    -- Entry states
+    ENTRY_IDLE   = Color3.fromRGB(22, 22, 27),
+    ENTRY_HOVER  = Color3.fromRGB(28, 28, 35),
+    ENTRY_SEL    = Color3.fromRGB(20, 50, 30),
+    ENTRY_MULTI  = Color3.fromRGB(18, 30, 62),
+    -- RE/RF badge
+    RE_CLR       = Color3.fromRGB(30, 110, 200),
+    RF_CLR       = Color3.fromRGB(130, 50, 200),
+}
+
+--------------------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------------------
+local spy = {
+    -- hooks
+    hooked        = {},    -- [remote] = true
+    blocked       = {},    -- [remoteName] = true
+    paused        = false,
+    -- log
+    entries       = {},    -- ordered list of entry objects
+    entryMap      = {},    -- [dedupeKey] = entry
+    totalCalls    = 0,
+    -- selection
+    selected      = nil,   -- single (code preview)
+    multiSel      = {},    -- [entry] = true
+    multiCount    = 0,
+    lastClickIdx  = nil,   -- for shift-range select
+    -- history ring buffer
+    history       = {},
+    histIdx       = 0,
+    -- execution
+    lastFire      = 0,
+    execLog       = {},    -- last MAX_EXEC_LOG results
+    loopConn      = nil,   -- active loop connection
+    loopRunning   = false,
+    -- ui
+    filterText    = "",
+    activeTab     = "log", -- "log" | "execlog"
+}
+
+--------------------------------------------------------------------------------
+-- UTILITY: UI BUILDERS
+--------------------------------------------------------------------------------
+local function corner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = obj
+    return c
+end
+
+local function uiStroke(obj, col, thick)
+    local s = Instance.new("UIStroke")
+    s.Color     = col   or T.BORDER
+    s.Thickness = thick or 1
+    s.Parent    = obj
+    return s
+end
+
+local function lbl(parent, txt, sz, col, font, xa, ya)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text           = txt   or ""
+    l.TextSize       = sz    or 13
+    l.TextColor3     = col   or T.TEXT
+    l.Font           = font  or Enum.Font.Gotham
+    l.TextXAlignment = xa    or Enum.TextXAlignment.Left
+    l.TextYAlignment = ya    or Enum.TextYAlignment.Center
+    l.TextWrapped    = false
+    l.Parent         = parent
+    return l
+end
+
+local function btn(parent, txt, sz, col, font)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = col  or T.BG3
+    b.Text             = txt  or ""
+    b.TextSize         = sz   or 12
+    b.TextColor3       = T.TEXT
+    b.Font             = font or Enum.Font.GothamBold
+    b.AutoButtonColor  = false
+    b.BorderSizePixel  = 0
+    b.Parent           = parent
+    return b
+end
+
+local function tweenProp(obj, props, t, style, dir)
+    TweenService:Create(obj,
+        TweenInfo.new(t or 0.15, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+        props):Play()
+end
+
+local function hoverBtn(b, hoverCol, baseCol)
+    baseCol = baseCol or b.BackgroundColor3
+    b.MouseEnter:Connect(function()  tweenProp(b, {BackgroundColor3 = hoverCol}) end)
+    b.MouseLeave:Connect(function()  tweenProp(b, {BackgroundColor3 = baseCol})  end)
+end
+
+--------------------------------------------------------------------------------
+-- UTILITY: ARG SNAPSHOT
+--------------------------------------------------------------------------------
+local function snap(...)
+    local n, s = select("#", ...), {}
+    for i = 1, n do s[i] = select(i, ...) end
+    s.n = n
+    return s
+end
+
+local function unsnap(s)
+    return table.unpack(s, 1, s.n or #s)
+end
+
+--------------------------------------------------------------------------------
+-- SERIALIZER
+--------------------------------------------------------------------------------
+local serialize  -- forward declare for recursion
+
+local function tryInstancePath(v)
+    local ok, path = pcall(function()
+        local parts, c = {}, v
+        while c and c ~= game do
+            table.insert(parts, 1, c.Name)
+            c = c.Parent
+        end
+        if #parts == 0 then return "game" end
+        local out = string.format('game:GetService("%s")', parts[1])
+        for i = 2, #parts do
+            out = out .. "." .. parts[i]
+        end
+        return out
+    end)
+    return ok and path or string.format('"[%s]"', v.ClassName)
+end
+
+serialize = function(v, depth, compact)
+    depth   = depth   or 0
+    compact = compact or false
+    if depth > 7 then return '"[MaxDepth]"' end
+
+    local t = typeof(v)
+
+    if     t == "nil"     then return "nil"
+    elseif t == "boolean" then return tostring(v)
+    elseif t == "number"  then
+        if v ~= v          then return "0/0"       end  -- NaN
+        if v == math.huge  then return "math.huge"  end
+        if v == -math.huge then return "-math.huge" end
+        if v == math.floor(v) and math.abs(v) < 1e12 then
+            return string.format("%d", v)
+        end
+        return string.format("%.6g", v)
+    elseif t == "string" then
+        return string.format("%q", v)
+
+    elseif t == "table" then
+        -- Detect mixed vs pure array vs pure dict
+        local maxn, kcount = 0, 0
+        for k, _ in pairs(v) do
+            kcount = kcount + 1
+            if type(k) == "number" and k == math.floor(k) and k > 0 then
+                maxn = math.max(maxn, k)
+            end
+        end
+        local isPureArray = (maxn == kcount)
+
+        local items, ind, und = {}, string.rep("    ", depth + 1), string.rep("    ", depth)
+        if isPureArray then
+            for i = 1, maxn do
+                items[i] = serialize(v[i], depth + 1, compact)
+            end
+        else
+            for k, val in pairs(v) do
+                local key = (type(k) == "string" and k:match("^[%a_][%w_]*$"))
+                    and k or ("[" .. serialize(k, depth + 1, compact) .. "]")
+                table.insert(items, key .. " = " .. serialize(val, depth + 1, compact))
+            end
+        end
+        local flat = "{" .. table.concat(items, ", ") .. "}"
+        if compact or #flat <= 60 then return flat end
+        return "{\n" .. ind .. table.concat(items, ",\n" .. ind) .. "\n" .. und .. "}"
+
+    elseif t == "Vector2" then
+        return string.format("Vector2.new(%s, %s)", serialize(v.X), serialize(v.Y))
+    elseif t == "Vector3" then
+        return string.format("Vector3.new(%s, %s, %s)", serialize(v.X), serialize(v.Y), serialize(v.Z))
+    elseif t == "CFrame" then
+        local p = v.Position
+        local rx, ry, rz = v:ToEulerAnglesXYZ()
+        return string.format("CFrame.new(%s, %s, %s) * CFrame.Angles(%s, %s, %s)",
+            serialize(p.X), serialize(p.Y), serialize(p.Z),
+            serialize(rx),  serialize(ry),  serialize(rz))
+    elseif t == "Color3" then
+        return string.format("Color3.fromRGB(%d, %d, %d)",
+            math.round(v.R*255), math.round(v.G*255), math.round(v.B*255))
+    elseif t == "UDim2" then
+        return string.format("UDim2.new(%s, %s, %s, %s)",
+            serialize(v.X.Scale), serialize(v.X.Offset),
+            serialize(v.Y.Scale), serialize(v.Y.Offset))
+    elseif t == "UDim" then
+        return string.format("UDim.new(%s, %s)", serialize(v.Scale), serialize(v.Offset))
+    elseif t == "Rect" then
+        return string.format("Rect.new(%s, %s, %s, %s)",
+            serialize(v.Min.X), serialize(v.Min.Y), serialize(v.Max.X), serialize(v.Max.Y))
+    elseif t == "NumberRange" then
+        return string.format("NumberRange.new(%s, %s)", serialize(v.Min), serialize(v.Max))
+    elseif t == "NumberSequence" then
+        local kps = {}
+        for _, kp in ipairs(v.Keypoints) do
+            table.insert(kps, string.format("NumberSequenceKeypoint.new(%s, %s, %s)",
+                serialize(kp.Time), serialize(kp.Value), serialize(kp.Envelope)))
+        end
+        return "NumberSequence.new({" .. table.concat(kps, ", ") .. "})"
+    elseif t == "ColorSequence" then
+        local kps = {}
+        for _, kp in ipairs(v.Keypoints) do
+            table.insert(kps, string.format("ColorSequenceKeypoint.new(%s, %s)",
+                serialize(kp.Time), serialize(kp.Value)))
+        end
+        return "ColorSequence.new({" .. table.concat(kps, ", ") .. "})"
+    elseif t == "BrickColor" then
+        return string.format("BrickColor.new(%q)", v.Name)
+    elseif t == "EnumItem" then
+        return string.format("Enum.%s.%s", tostring(v.EnumType), v.Name)
+    elseif t == "Instance" then
+        return tryInstancePath(v)
+    elseif t == "TweenInfo" then
+        return string.format("TweenInfo.new(%s, Enum.EasingStyle.%s, Enum.EasingDirection.%s, %s, %s, %s)",
+            serialize(v.Time), v.EasingStyle.Name, v.EasingDirection.Name,
+            serialize(v.RepeatCount), tostring(v.Reverses), serialize(v.DelayTime))
+    elseif t == "RaycastParams" then
+        return '"[RaycastParams — not reconstructible]"'
+    elseif t == "OverlapParams" then
+        return '"[OverlapParams — not reconstructible]"'
+    else
+        local ok, j = pcall(function() return HttpService:JSONEncode(v) end)
+        return ok and j or string.format('"[%s]"', t)
+    end
+end
+
+local function serializeArgs(args, compact)
+    local parts = {}
+    for i = 1, (args.n or #args) do
+        parts[i] = serialize(args[i], 0, compact)
+    end
+    return table.concat(parts, ", ")
+end
+
+-- One-line arg preview for tooltips / log row subtitles
+local function argPreview(args)
+    local s = serializeArgs(args, true)
+    if #s > 72 then s = s:sub(1, 69) .. "…" end
+    return s
+end
+
+--------------------------------------------------------------------------------
+-- PATH RESOLVER  (game:GetService("X").Y.Z  dot-notation)
+--------------------------------------------------------------------------------
+local function resolvePath(obj)
+    local parts, cur = {}, obj
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    if #parts == 0 then return "game" end
+    local out = string.format('game:GetService("%s")', parts[1])
+    for i = 2, #parts do
+        out = out .. "." .. parts[i]
+    end
+    return out
+end
+
+--------------------------------------------------------------------------------
+-- CODE GENERATION
+--------------------------------------------------------------------------------
+local function getCallerName(remoteType, args)
+    if remoteType == "RemoteFunction" then return "Server → " .. LP.Name end
+    for i = 1, (args.n or #args) do
+        local v = args[i]
+        if typeof(v) == "Instance" and v:IsA("Player") then return "@ " .. v.Name end
+    end
+    return LP.Name
+end
+
+local function generateCode(entry)
+    local remote     = entry.remote
+    local args       = entry.args
+    local remoteType = entry.remoteType
+    local method     = (remoteType == "RemoteFunction") and "InvokeServer" or "FireServer"
+    local n          = args.n or #args
+
+    local lines = {"local args = {"}
+    for i = 1, n do
+        local comma = (i < n) and "," or ""
+        lines[#lines + 1] = string.format(
+            "    [%d] = %s%s", i, serialize(args[i], 1, true), comma)
+    end
+    lines[#lines + 1] = "}"
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = resolvePath(remote) .. ":" .. method .. "(unpack(args))"
+
+    return table.concat(lines, "\n")
+end
+
+local function dedupeKey(remote, args)
+    local ok, j = pcall(function() return HttpService:JSONEncode(args) end)
+    return remote:GetFullName() .. "|" .. (ok and j or tostring(args))
+end
+
+--------------------------------------------------------------------------------
+-- MULTI-SELECT
+--------------------------------------------------------------------------------
+local function addMulti(entry)
+    if not spy.multiSel[entry] then
+        spy.multiSel[entry] = true
+        spy.multiCount = spy.multiCount + 1
+    end
+end
+
+local function remMulti(entry)
+    if spy.multiSel[entry] then
+        spy.multiSel[entry] = nil
+        spy.multiCount = spy.multiCount - 1
+    end
+end
+
+local function clearMulti()
+    for e in pairs(spy.multiSel) do
+        if e.btn and e.btn.Parent then
+            e.btn.BackgroundColor3 = (spy.selected == e) and T.ENTRY_SEL or T.ENTRY_IDLE
+        end
+    end
+    spy.multiSel   = {}
+    spy.multiCount = 0
+end
+
+local function entryColor(e)
+    if spy.multiSel[e]    then return T.ENTRY_MULTI end
+    if spy.selected == e  then return T.ENTRY_SEL   end
+    return T.ENTRY_IDLE
+end
+
+--------------------------------------------------------------------------------
+-- SCREEN GUI
+--------------------------------------------------------------------------------
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "RemoteSpy_v5"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() ScreenGui.IgnoreGuiInset = true end)
+ScreenGui.Parent         = LP:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- MAIN WINDOW
+--------------------------------------------------------------------------------
+local WIN_W, WIN_H = 820, 500
+
+local Main = Instance.new("Frame")
+Main.Name             = "Main"
+Main.Size             = UDim2.fromOffset(WIN_W, WIN_H)
+Main.Position         = UDim2.fromOffset(60, 60)
+Main.BackgroundColor3 = T.BG
+Main.BorderSizePixel  = 0
+Main.Active           = true
+Main.Draggable        = true
+Main.ClipsDescendants = true
+Main.Parent           = ScreenGui
+corner(Main, 10)
+uiStroke(Main, T.BORDER, 1)
+
+--------------------------------------------------------------------------------
+-- TITLE BAR
+--------------------------------------------------------------------------------
+local TitleBar = Instance.new("Frame")
+TitleBar.Name             = "TitleBar"
+TitleBar.Size             = UDim2.new(1, 0, 0, 40)
+TitleBar.BackgroundColor3 = T.BG2
+TitleBar.BorderSizePixel  = 0
+TitleBar.ZIndex           = 5
+TitleBar.Parent           = Main
+corner(TitleBar, 10)
+
+-- bottom border
+local TBBorder = Instance.new("Frame")
+TBBorder.Size             = UDim2.new(1, 0, 0, 1)
+TBBorder.Position         = UDim2.new(0, 0, 1, -1)
+TBBorder.BackgroundColor3 = T.BORDER
+TBBorder.BorderSizePixel  = 0
+TBBorder.Parent           = TitleBar
+
+-- status dot
+local StatusDot = Instance.new("Frame")
+StatusDot.Size             = UDim2.fromOffset(8, 8)
+StatusDot.Position         = UDim2.new(0, 14, 0.5, -4)
+StatusDot.BackgroundColor3 = T.GREEN
+StatusDot.BorderSizePixel  = 0
+StatusDot.ZIndex           = 6
+StatusDot.Parent           = TitleBar
+corner(StatusDot, 4)
+
+local TitleLbl = lbl(TitleBar, "  REMOTE SPY  v" .. VERSION, 13,
+    T.TEXT, Enum.Font.GothamBold, Enum.TextXAlignment.Left)
+TitleLbl.Size     = UDim2.new(0, 200, 1, 0)
+TitleLbl.Position = UDim2.fromOffset(22, 0)
+TitleLbl.ZIndex   = 6
+
+-- call counter
+local CallsLbl = lbl(TitleBar, "0 calls", 11, T.TEXT_DIM,
+    Enum.Font.Gotham, Enum.TextXAlignment.Center)
+CallsLbl.Size     = UDim2.fromOffset(90, 40)
+CallsLbl.Position = UDim2.new(0, 230, 0, 0)
+CallsLbl.ZIndex   = 6
+
+-- multi-select badge
+local MultiBadge = Instance.new("Frame")
+MultiBadge.Size             = UDim2.fromOffset(22, 16)
+MultiBadge.Position         = UDim2.new(0, 325, 0.5, -8)
+MultiBadge.BackgroundColor3 = T.BLUE_DIM
+MultiBadge.BorderSizePixel  = 0
+MultiBadge.Visible          = false
+MultiBadge.ZIndex           = 6
+MultiBadge.Parent           = TitleBar
+corner(MultiBadge, 8)
+local MultiBadgeLbl = lbl(MultiBadge, "0", 9, Color3.new(1,1,1),
+    Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+MultiBadgeLbl.Size   = UDim2.new(1,0,1,0)
+MultiBadgeLbl.ZIndex = 7
+
+-- PAUSED badge
+local PausedBadge = Instance.new("Frame")
+PausedBadge.Size             = UDim2.fromOffset(54, 18)
+PausedBadge.Position         = UDim2.new(0, 355, 0.5, -9)
+PausedBadge.BackgroundColor3 = T.ORANGE
+PausedBadge.BorderSizePixel  = 0
+PausedBadge.Visible          = false
+PausedBadge.ZIndex           = 6
+PausedBadge.Parent           = TitleBar
+corner(PausedBadge, 4)
+local PausedLbl = lbl(PausedBadge, "PAUSED", 9, Color3.new(1,1,1),
+    Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+PausedLbl.Size   = UDim2.new(1,0,1,0)
+PausedLbl.ZIndex = 7
+
+-- Right-side icon buttons (minimize, pause, close feel)
+local function mkIconBtn(xOff, icon)
+    local b = Instance.new("TextButton")
+    b.Size             = UDim2.fromOffset(28, 28)
+    b.Position         = UDim2.new(1, xOff, 0.5, -14)
+    b.BackgroundColor3 = T.BG3
+    b.Text             = icon
+    b.TextColor3       = T.TEXT_DIM
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = 14
+    b.AutoButtonColor  = false
+    b.ZIndex           = 6
+    b.Parent           = TitleBar
+    corner(b, 6)
+    hoverBtn(b, T.BG4, T.BG3)
+    return b
+end
+
+local MinBtn   = mkIconBtn(-36, "─")
+local PauseBtn = mkIconBtn(-70, "⏸")
+
+-- Search bar
+local SearchFrame = Instance.new("Frame")
+SearchFrame.Size             = UDim2.fromOffset(160, 24)
+SearchFrame.Position         = UDim2.new(1, -240, 0.5, -12)
+SearchFrame.BackgroundColor3 = T.BG3
+SearchFrame.BorderSizePixel  = 0
+SearchFrame.ZIndex           = 6
+SearchFrame.Parent           = TitleBar
+corner(SearchFrame, 5)
+uiStroke(SearchFrame, T.BORDER2, 1)
+
+local SearchIcon = lbl(SearchFrame, "🔍", 11, T.TEXT_MUTED, Enum.Font.Gotham,
+    Enum.TextXAlignment.Center)
+SearchIcon.Size     = UDim2.fromOffset(22, 24)
+SearchIcon.Position = UDim2.fromOffset(2, 0)
+SearchIcon.ZIndex   = 7
+
+local SearchBox = Instance.new("TextBox")
+SearchBox.Size              = UDim2.new(1, -26, 1, 0)
+SearchBox.Position          = UDim2.fromOffset(24, 0)
+SearchBox.BackgroundTransparency = 1
+SearchBox.Text              = ""
+SearchBox.PlaceholderText   = "Filter remotes…"
+SearchBox.PlaceholderColor3 = T.TEXT_MUTED
+SearchBox.TextColor3        = T.TEXT
+SearchBox.Font              = Enum.Font.Gotham
+SearchBox.TextSize          = 11
+SearchBox.ClearTextOnFocus  = false
+SearchBox.TextXAlignment    = Enum.TextXAlignment.Left
+SearchBox.ZIndex            = 7
+SearchBox.Parent            = SearchFrame
+
+--------------------------------------------------------------------------------
+-- TAB BAR  (below title bar)
+--------------------------------------------------------------------------------
+local TabBar = Instance.new("Frame")
+TabBar.Size             = UDim2.new(1, 0, 0, 30)
+TabBar.Position         = UDim2.fromOffset(0, 40)
+TabBar.BackgroundColor3 = T.BG2
+TabBar.BorderSizePixel  = 0
+TabBar.Parent           = Main
+
+local TabBorder = Instance.new("Frame")
+TabBorder.Size             = UDim2.new(1, 0, 0, 1)
+TabBorder.Position         = UDim2.new(0, 0, 1, -1)
+TabBorder.BackgroundColor3 = T.BORDER
+TabBorder.BorderSizePixel  = 0
+TabBorder.Parent           = TabBar
+
+local function mkTab(txt, xOff)
+    local f = Instance.new("Frame")
+    f.Size             = UDim2.fromOffset(110, 30)
+    f.Position         = UDim2.fromOffset(xOff, 0)
+    f.BackgroundTransparency = 1
+    f.Parent           = TabBar
+
+    local b = Instance.new("TextButton")
+    b.Size             = UDim2.new(1, 0, 1, 0)
+    b.BackgroundTransparency = 1
+    b.Text             = txt
+    b.TextColor3       = T.TEXT_DIM
+    b.Font             = Enum.Font.GothamSemibold
+    b.TextSize         = 12
+    b.AutoButtonColor  = false
+    b.Parent           = f
+
+    local indicator = Instance.new("Frame")
+    indicator.Size             = UDim2.new(0.7, 0, 0, 2)
+    indicator.Position         = UDim2.new(0.15, 0, 1, -2)
+    indicator.BackgroundColor3 = T.GREEN
+    indicator.BorderSizePixel  = 0
+    indicator.Visible          = false
+    indicator.Parent           = f
+    corner(indicator, 1)
+
+    return b, indicator
+end
+
+local TabLog,     TabLogInd     = mkTab("  REMOTE LOG",    4)
+local TabExecLog, TabExecLogInd = mkTab("  EXEC HISTORY",  118)
+
+--------------------------------------------------------------------------------
+-- BODY — holds log panel + divider + control panel
+--------------------------------------------------------------------------------
+local Body = Instance.new("Frame")
+Body.Name             = "Body"
+Body.Size             = UDim2.new(1, 0, 1, -71)  -- below titlebar+tabbar
+Body.Position         = UDim2.fromOffset(0, 71)
+Body.BackgroundTransparency = 1
+Body.ClipsDescendants = false
+Body.Parent           = Main
+
+--------------------------------------------------------------------------------
+-- LOG PANEL (left)
+--------------------------------------------------------------------------------
+local logPanelW = 430   -- default width
+
+local LogPanel = Instance.new("Frame")
+LogPanel.Name             = "LogPanel"
+LogPanel.Size             = UDim2.fromOffset(logPanelW, 0) -- height from Body
+LogPanel.Size             = UDim2.new(0, logPanelW, 1, 0)
+LogPanel.BackgroundTransparency = 1
+LogPanel.ClipsDescendants = true
+LogPanel.Parent           = Body
+
+local LogFrame = Instance.new("ScrollingFrame")
+LogFrame.Name                 = "LogFrame"
+LogFrame.Size                 = UDim2.new(1, -8, 1, -8)
+LogFrame.Position             = UDim2.fromOffset(4, 4)
+LogFrame.BackgroundColor3     = T.BG2
+LogFrame.ScrollBarThickness   = 4
+LogFrame.ScrollBarImageColor3 = T.BORDER2
+LogFrame.BorderSizePixel      = 0
+LogFrame.CanvasSize           = UDim2.new(0, 0, 0, 0)
+LogFrame.Parent               = LogPanel
+corner(LogFrame, 6)
+uiStroke(LogFrame, T.BORDER, 1)
+
+local LogLayout = Instance.new("UIListLayout")
+LogLayout.Padding         = UDim.new(0, 2)
+LogLayout.SortOrder       = Enum.SortOrder.LayoutOrder
+LogLayout.Parent          = LogFrame
+
+local LogPad = Instance.new("UIPadding")
+LogPad.PaddingTop    = UDim.new(0, 4)
+LogPad.PaddingBottom = UDim.new(0, 4)
+LogPad.PaddingLeft   = UDim.new(0, 4)
+LogPad.PaddingRight  = UDim.new(0, 4)
+LogPad.Parent        = LogFrame
+
+-- EXEC LOG (shown when tab = execlog)
+local ExecLogFrame = Instance.new("ScrollingFrame")
+ExecLogFrame.Name                 = "ExecLogFrame"
+ExecLogFrame.Size                 = UDim2.new(1, -8, 1, -8)
+ExecLogFrame.Position             = UDim2.fromOffset(4, 4)
+ExecLogFrame.BackgroundColor3     = T.BG2
+ExecLogFrame.ScrollBarThickness   = 4
+ExecLogFrame.ScrollBarImageColor3 = T.BORDER2
+ExecLogFrame.BorderSizePixel      = 0
+ExecLogFrame.Visible              = false
+ExecLogFrame.CanvasSize           = UDim2.new(0, 0, 0, 0)
+ExecLogFrame.Parent               = LogPanel
+corner(ExecLogFrame, 6)
+uiStroke(ExecLogFrame, T.BORDER, 1)
+
+local ExecLogLayout = Instance.new("UIListLayout")
+ExecLogLayout.Padding   = UDim.new(0, 2)
+ExecLogLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ExecLogLayout.Parent    = ExecLogFrame
+
+local ExecLogPad = Instance.new("UIPadding")
+ExecLogPad.PaddingTop    = UDim.new(0, 4)
+ExecLogPad.PaddingBottom = UDim.new(0, 4)
+ExecLogPad.PaddingLeft   = UDim.new(0, 4)
+ExecLogPad.PaddingRight  = UDim.new(0, 4)
+ExecLogPad.Parent        = ExecLogFrame
+
+--------------------------------------------------------------------------------
+-- DIVIDER (drag to resize panels)
+--------------------------------------------------------------------------------
+local Divider = Instance.new("Frame")
+Divider.Name             = "Divider"
+Divider.Size             = UDim2.new(0, 5, 1, 0)
+Divider.Position         = UDim2.fromOffset(logPanelW, 0)
+Divider.BackgroundColor3 = T.BORDER
+Divider.BorderSizePixel  = 0
+Divider.Parent           = Body
+
+local DivHandle = Instance.new("TextButton")
+DivHandle.Size             = UDim2.new(1, 4, 1, 0)
+DivHandle.Position         = UDim2.fromOffset(-2, 0)
+DivHandle.BackgroundTransparency = 1
+DivHandle.Text             = ""
+DivHandle.AutoButtonColor  = false
+DivHandle.Parent           = Divider
+
+--------------------------------------------------------------------------------
+-- CONTROL PANEL (right)
+--------------------------------------------------------------------------------
+local CtrlPanel = Instance.new("Frame")
+CtrlPanel.Name             = "CtrlPanel"
+CtrlPanel.Size             = UDim2.new(1, -(logPanelW + 5), 1, 0)
+CtrlPanel.Position         = UDim2.fromOffset(logPanelW + 5, 0)
+CtrlPanel.BackgroundTransparency = 1
+CtrlPanel.ClipsDescendants = true
+CtrlPanel.Parent           = Body
+
+-- CODE EDITOR header
+local CodeHeader = Instance.new("Frame")
+CodeHeader.Size             = UDim2.new(1, -8, 0, 22)
+CodeHeader.Position         = UDim2.fromOffset(4, 4)
+CodeHeader.BackgroundColor3 = T.BG3
+CodeHeader.BorderSizePixel  = 0
+CodeHeader.Parent           = CtrlPanel
+corner(CodeHeader, 4)
+
+local CodeHdrLbl = lbl(CodeHeader, "  CODE PREVIEW / EDIT", 10, T.TEXT_MUTED,
+    Enum.Font.GothamBold)
+CodeHdrLbl.Size     = UDim2.new(0.6, 0, 1, 0)
+
+local CodeLangLbl = lbl(CodeHeader, "Lua  ", 10, T.TEXT_MUTED,
+    Enum.Font.Code, Enum.TextXAlignment.Right)
+CodeLangLbl.Size = UDim2.new(0.4, 0, 1, 0)
+
+-- CODE BOX
+local CodeBox = Instance.new("TextBox")
+CodeBox.Size              = UDim2.new(1, -8, 0, 178)
+CodeBox.Position          = UDim2.fromOffset(4, 28)
+CodeBox.BackgroundColor3  = T.BG
+CodeBox.TextColor3        = T.CODE
+CodeBox.PlaceholderColor3 = T.TEXT_MUTED
+CodeBox.PlaceholderText   = "-- Click a log entry to generate code --"
+CodeBox.Font              = Enum.Font.Code
+CodeBox.TextSize          = 11
+CodeBox.TextXAlignment    = Enum.TextXAlignment.Left
+CodeBox.TextYAlignment    = Enum.TextYAlignment.Top
+CodeBox.ClearTextOnFocus  = false
+CodeBox.MultiLine         = true
+CodeBox.TextWrapped       = true
+CodeBox.Text              = ""
+CodeBox.Parent            = CtrlPanel
+corner(CodeBox, 4)
+uiStroke(CodeBox, T.BORDER, 1)
+
+-- STATUS BAR
+local StatusBar = Instance.new("Frame")
+StatusBar.Size             = UDim2.new(1, -8, 0, 20)
+StatusBar.Position         = UDim2.fromOffset(4, 208)
+StatusBar.BackgroundColor3 = T.BG2
+StatusBar.BorderSizePixel  = 0
+StatusBar.Parent           = CtrlPanel
+corner(StatusBar, 3)
+
+local StatusLbl = lbl(StatusBar, "", 10, T.TEXT_DIM, Enum.Font.Code)
+StatusLbl.Size        = UDim2.new(1, -8, 1, 0)
+StatusLbl.Position    = UDim2.fromOffset(6, 0)
+StatusLbl.TextWrapped = false
+
+local function setStatus(txt, col)
+    StatusLbl.Text       = txt
+    StatusLbl.TextColor3 = col or T.TEXT_DIM
+end
+
+--------------------------------------------------------------------------------
+-- REPEAT FIRE ROW
+--------------------------------------------------------------------------------
+local RepeatRow = Instance.new("Frame")
+RepeatRow.Size             = UDim2.new(1, -8, 0, 26)
+RepeatRow.Position         = UDim2.fromOffset(4, 232)
+RepeatRow.BackgroundColor3 = T.BG2
+RepeatRow.BorderSizePixel  = 0
+RepeatRow.Parent           = CtrlPanel
+corner(RepeatRow, 4)
+
+local RepeatLbl = lbl(RepeatRow, "  Repeat:", 10, T.TEXT_DIM, Enum.Font.Gotham)
+RepeatLbl.Size     = UDim2.fromOffset(60, 26)
+
+local RepeatBox = Instance.new("TextBox")
+RepeatBox.Size             = UDim2.fromOffset(36, 18)
+RepeatBox.Position         = UDim2.fromOffset(62, 4)
+RepeatBox.BackgroundColor3 = T.BG3
+RepeatBox.TextColor3       = T.TEXT
+RepeatBox.Font             = Enum.Font.Code
+RepeatBox.TextSize         = 11
+RepeatBox.Text             = "1"
+RepeatBox.TextXAlignment   = Enum.TextXAlignment.Center
+RepeatBox.Parent           = RepeatRow
+corner(RepeatBox, 3)
+uiStroke(RepeatBox, T.BORDER, 1)
+
+local IntervalLbl = lbl(RepeatRow, "  Interval (s):", 10, T.TEXT_DIM, Enum.Font.Gotham)
+IntervalLbl.Size     = UDim2.fromOffset(80, 26)
+IntervalLbl.Position = UDim2.fromOffset(100, 0)
+
+local IntervalBox = Instance.new("TextBox")
+IntervalBox.Size             = UDim2.fromOffset(40, 18)
+IntervalBox.Position         = UDim2.fromOffset(184, 4)
+IntervalBox.BackgroundColor3 = T.BG3
+IntervalBox.TextColor3       = T.TEXT
+IntervalBox.Font             = Enum.Font.Code
+IntervalBox.TextSize         = 11
+IntervalBox.Text             = "0"
+IntervalBox.TextXAlignment   = Enum.TextXAlignment.Center
+IntervalBox.Parent           = RepeatRow
+corner(IntervalBox, 3)
+uiStroke(IntervalBox, T.BORDER, 1)
+
+local LoopToggle = Instance.new("TextButton")
+LoopToggle.Size             = UDim2.fromOffset(50, 18)
+LoopToggle.Position         = UDim2.fromOffset(228, 4)
+LoopToggle.BackgroundColor3 = T.BG3
+LoopToggle.Text             = "LOOP"
+LoopToggle.TextColor3       = T.TEXT_DIM
+LoopToggle.Font             = Enum.Font.GothamBold
+LoopToggle.TextSize         = 9
+LoopToggle.AutoButtonColor  = false
+LoopToggle.Parent           = RepeatRow
+corner(LoopToggle, 3)
+uiStroke(LoopToggle, T.BORDER, 1)
+
+-- Multi-fire delay
+local MultiDelayLbl = lbl(RepeatRow, "  Multi Δ:", 10, T.TEXT_DIM, Enum.Font.Gotham)
+MultiDelayLbl.Size     = UDim2.fromOffset(58, 26)
+MultiDelayLbl.Position = UDim2.fromOffset(282, 0)
+
+local MultiDelayBox = Instance.new("TextBox")
+MultiDelayBox.Size             = UDim2.fromOffset(34, 18)
+MultiDelayBox.Position         = UDim2.fromOffset(340, 4)
+MultiDelayBox.BackgroundColor3 = T.BG3
+MultiDelayBox.TextColor3       = T.TEXT
+MultiDelayBox.Font             = Enum.Font.Code
+MultiDelayBox.TextSize         = 11
+MultiDelayBox.Text             = "0"
+MultiDelayBox.TextXAlignment   = Enum.TextXAlignment.Center
+MultiDelayBox.Parent           = RepeatRow
+corner(MultiDelayBox, 3)
+uiStroke(MultiDelayBox, T.BORDER, 1)
+
+--------------------------------------------------------------------------------
+-- ACTION BUTTONS  (2 columns × 3 rows)
+--------------------------------------------------------------------------------
+local BtnGrid = Instance.new("Frame")
+BtnGrid.Size             = UDim2.new(1, -8, 0, 110)
+BtnGrid.Position         = UDim2.fromOffset(4, 262)
+BtnGrid.BackgroundTransparency = 1
+BtnGrid.Parent           = CtrlPanel
+
+local BtnLayout = Instance.new("UIGridLayout")
+BtnLayout.CellSize         = UDim2.new(0.5, -3, 0, 30)
+BtnLayout.CellPadding      = UDim2.fromOffset(4, 4)
+BtnLayout.SortOrder        = Enum.SortOrder.LayoutOrder
+BtnLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+BtnLayout.Parent           = BtnGrid
+
+local function actionBtn(txt, bgCol, order)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = bgCol
+    b.Text             = txt
+    b.TextColor3       = Color3.new(1,1,1)
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = 11
+    b.AutoButtonColor  = false
+    b.LayoutOrder      = order or 0
+    b.Parent           = BtnGrid
+    corner(b, 5)
+    hoverBtn(b, Color3.new(
+        math.min(bgCol.R + 0.1, 1),
+        math.min(bgCol.G + 0.1, 1),
+        math.min(bgCol.B + 0.1, 1)), bgCol)
+    return b
+end
+
+local FireBtn     = actionBtn("▶  FIRE SELECTED",       T.GREEN_DIM,                  1)
+local FireAllBtn  = actionBtn("⚡  FIRE ALL (0)",        T.BLUE_DIM,                   2)
+local CopyBtn     = actionBtn("⎘  COPY CODE",           Color3.fromRGB(40, 80, 160),  3)
+local BlockBtn    = actionBtn("⊘  BLOCK REMOTE",        Color3.fromRGB(150, 95, 15),  4)
+local DeselectBtn = actionBtn("☐  DESELECT ALL",        Color3.fromRGB(55, 55, 75),   5)
+local ClearBtn    = actionBtn("✕  CLEAR LOGS",          Color3.fromRGB(140, 35, 35),  6)
+
+--------------------------------------------------------------------------------
+-- LOG ENTRY BUILDER
+--------------------------------------------------------------------------------
+local function updateCountLbl()
+    CallsLbl.Text = spy.totalCalls .. " call" .. (spy.totalCalls ~= 1 and "s" or "")
+end
+
+local function updateMultiBadge()
+    if spy.multiCount > 0 then
+        MultiBadge.Visible    = true
+        MultiBadgeLbl.Text    = tostring(spy.multiCount)
+        FireAllBtn.Text       = "⚡  FIRE ALL (" .. spy.multiCount .. ")"
+    else
+        MultiBadge.Visible    = false
+        FireAllBtn.Text       = "⚡  FIRE ALL (0)"
+    end
+end
+
+local function updateCanvas()
+    LogFrame.CanvasSize = UDim2.new(0, 0, 0, LogLayout.AbsoluteContentSize.Y + 8)
+    local c = LogFrame.AbsoluteCanvasSize.Y
+    local w = LogFrame.AbsoluteWindowSize.Y
+    if c - LogFrame.CanvasPosition.Y - w < SCROLL_THRESH then
+        LogFrame.CanvasPosition = Vector2.new(0, math.huge)
+    end
+end
+
+local function matchesFilter(name)
+    if spy.filterText == "" then return true end
+    return name:lower():find(spy.filterText:lower(), 1, true) ~= nil
+end
+
+local function refreshFilter()
+    for _, entry in ipairs(spy.entries) do
+        if entry.btn and entry.btn.Parent then
+            entry.btn.Visible = matchesFilter(entry.remote.Name)
+        end
+    end
+    updateCanvas()
+end
+
+-- Build a single log row
+local function buildLogEntry(remote, args, remoteType)
+    local caller    = getCallerName(remoteType, args)
+    local preview   = argPreview(args)
+    local timestamp = os.date("%H:%M:%S")
+
+    local entry = {
+        remote     = remote,
+        args       = args,
+        remoteType = remoteType,
+        caller     = caller,
+        count      = 1,
+        lastTime   = os.clock(),
+        timestamp  = timestamp,
+        listIndex  = #spy.entries + 1,
+    }
+
+    local btn_h = Instance.new("TextButton")
+    btn_h.Name             = "Entry_" .. remote.Name
+    btn_h.Size             = UDim2.new(1, 0, 0, 46)
+    btn_h.BackgroundColor3 = T.ENTRY_IDLE
+    btn_h.Text             = ""
+    btn_h.AutoButtonColor  = false
+    btn_h.LayoutOrder      = entry.listIndex
+    btn_h.Visible          = matchesFilter(remote.Name)
+    btn_h.Parent           = LogFrame
+    corner(btn_h, 4)
+
+    -- left accent bar (RE=blue / RF=purple)
+    local accent = Instance.new("Frame")
+    accent.Size             = UDim2.fromOffset(3, 34)
+    accent.Position         = UDim2.fromOffset(4, 6)
+    accent.BackgroundColor3 = remoteType == "RemoteFunction" and T.RF_CLR or T.RE_CLR
+    accent.BorderSizePixel  = 0
+    accent.Parent           = btn_h
+    corner(accent, 2)
+
+    -- RE / RF text badge
+    local typeBadge = Instance.new("Frame")
+    typeBadge.Size             = UDim2.fromOffset(24, 14)
+    typeBadge.Position         = UDim2.fromOffset(10, 8)
+    typeBadge.BackgroundColor3 = remoteType == "RemoteFunction" and T.RF_CLR or T.RE_CLR
+    typeBadge.BorderSizePixel  = 0
+    typeBadge.Parent           = btn_h
+    corner(typeBadge, 3)
+    local typeTxt = lbl(typeBadge, remoteType == "RemoteFunction" and "RF" or "RE",
+        8, Color3.new(1,1,1), Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    typeTxt.Size = UDim2.new(1,0,1,0)
+
+    -- Remote name
+    local nameLbl2 = lbl(btn_h, remote.Name, 13, T.TEXT, Enum.Font.GothamSemibold)
+    nameLbl2.Size     = UDim2.new(1, -110, 0, 18)
+    nameLbl2.Position = UDim2.fromOffset(38, 5)
+
+    -- Arg preview (dim, smaller)
+    local previewLbl = lbl(btn_h, preview, 10, T.TEXT_MUTED, Enum.Font.Code)
+    previewLbl.Size     = UDim2.new(1, -110, 0, 14)
+    previewLbl.Position = UDim2.fromOffset(38, 25)
+    previewLbl.TextWrapped = false
+
+    -- Timestamp top-right
+    local tsLbl = lbl(btn_h, timestamp, 9, T.TEXT_MUTED, Enum.Font.Code,
+        Enum.TextXAlignment.Right)
+    tsLbl.Size     = UDim2.fromOffset(56, 14)
+    tsLbl.Position = UDim2.new(1, -62, 0, 6)
+
+    -- Call count badge (top-right, shows after >1)
+    local cntWrap = Instance.new("Frame")
+    cntWrap.Size             = UDim2.fromOffset(28, 14)
+    cntWrap.Position         = UDim2.new(1, -62, 0, 22)
+    cntWrap.BackgroundColor3 = T.BG4
+    cntWrap.BorderSizePixel  = 0
+    cntWrap.Visible          = false
+    cntWrap.Parent           = btn_h
+    corner(cntWrap, 7)
+    local cntLbl2 = lbl(cntWrap, "×1", 8, T.TEXT_DIM,
+        Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    cntLbl2.Size = UDim2.new(1,0,1,0)
+
+    entry.btn     = btn_h
+    entry.cntWrap = cntWrap
+    entry.cntLbl  = cntLbl2
+    entry.previewLbl = previewLbl
+
+    -- ── CLICK HANDLERS ────────────────────────────────────────────────────
+    btn_h.MouseButton1Click:Connect(function()
+        local ctrl  = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+                   or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+        local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+                   or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+
+        if ctrl then
+            -- Toggle multi-select
+            if spy.multiSel[entry] then
+                remMulti(entry)
+                btn_h.BackgroundColor3 = (spy.selected == entry) and T.ENTRY_SEL or T.ENTRY_IDLE
+            else
+                addMulti(entry)
+                btn_h.BackgroundColor3 = T.ENTRY_MULTI
+            end
+            updateMultiBadge()
+            setStatus("⚡ " .. spy.multiCount .. " selected  |  Ctrl+Click to toggle",
+                T.BLUE)
+
+        elseif shift and spy.lastClickIdx then
+            -- Range select
+            local a = math.min(spy.lastClickIdx, entry.listIndex)
+            local b2 = math.max(spy.lastClickIdx, entry.listIndex)
+            for _, e in ipairs(spy.entries) do
+                if e.listIndex >= a and e.listIndex <= b2 then
+                    addMulti(e)
+                    if e.btn and e.btn.Parent then
+                        e.btn.BackgroundColor3 = T.ENTRY_MULTI
+                    end
+                end
+            end
+            updateMultiBadge()
+            setStatus("⚡ Range selected " .. spy.multiCount .. " entries", T.BLUE)
+
+        else
+            -- Normal single select
+            if spy.selected and spy.selected.btn and spy.selected.btn.Parent then
+                spy.selected.btn.BackgroundColor3 = entryColor(spy.selected)
+            end
+            spy.selected    = entry
+            spy.lastClickIdx = entry.listIndex
+            btn_h.BackgroundColor3 = spy.multiSel[entry] and T.ENTRY_MULTI or T.ENTRY_SEL
+            CodeBox.Text     = generateCode(entry)
+            BlockBtn.Text    = "⊘  BLOCK: " .. remote.Name
+            if spy.multiCount == 0 then setStatus("") end
+        end
+    end)
+
+    -- Right-click = instant block
+    btn_h.MouseButton2Click:Connect(function()
+        remMulti(entry)
+        updateMultiBadge()
+        spy.blocked[remote.Name] = true
+        if spy.selected == entry then
+            spy.selected = nil
+            CodeBox.Text = ""
+        end
+        btn_h:Destroy()
+        for i, e in ipairs(spy.entries) do
+            if e == entry then table.remove(spy.entries, i) break end
+        end
+        spy.entryMap[dedupeKey(remote, args)] = nil
+        setStatus("⊘ Blocked: " .. remote.Name, T.ORANGE)
+    end)
+
+    btn_h.MouseEnter:Connect(function()
+        if entryColor(entry) == T.ENTRY_IDLE then
+            btn_h.BackgroundColor3 = T.ENTRY_HOVER
+        end
+    end)
+    btn_h.MouseLeave:Connect(function()
+        btn_h.BackgroundColor3 = entryColor(entry)
+    end)
+
+    return entry
+end
+
+-- Main addLog function
+local function addLog(remote, args, remoteType)
+    if spy.paused                    then return end
+    if spy.blocked[remote.Name]      then return end
+
+    spy.totalCalls = spy.totalCalls + 1
+    updateCountLbl()
+
+    -- Ring buffer
+    spy.histIdx = (spy.histIdx % MAX_HISTORY) + 1
+    spy.history[spy.histIdx] = { remote=remote, args=args, rtype=remoteType, t=os.clock() }
+
+    -- Dedup
+    local key = dedupeKey(remote, args)
+    local now = os.clock()
+    local ex  = spy.entryMap[key]
+
+    if ex and (now - ex.lastTime) < DEDUPE_WINDOW and ex.btn and ex.btn.Parent then
+        ex.count    = ex.count + 1
+        ex.lastTime = now
+        ex.args     = args
+        -- Flash
+        ex.btn.BackgroundColor3 = Color3.fromRGB(25, 55, 30)
+        task.delay(0.12, function()
+            if ex.btn and ex.btn.Parent then
+                ex.btn.BackgroundColor3 = entryColor(ex)
+            end
+        end)
+        -- Update count badge
+        ex.cntWrap.Visible = true
+        ex.cntLbl.Text     = "×" .. ex.count
+        -- Update arg preview to latest
+        if ex.previewLbl then
+            ex.previewLbl.Text = argPreview(args)
+        end
+        return
+    end
+
+    local entry = buildLogEntry(remote, args, remoteType)
+    table.insert(spy.entries, entry)
+    spy.entryMap[key] = entry
+
+    updateCanvas()
+end
+
+--------------------------------------------------------------------------------
+-- TAB SWITCHING
+--------------------------------------------------------------------------------
+local function setTab(tab)
+    spy.activeTab = tab
+    LogFrame.Visible      = (tab == "log")
+    ExecLogFrame.Visible  = (tab == "execlog")
+    TabLogInd.Visible     = (tab == "log")
+    TabExecLogInd.Visible = (tab == "execlog")
+    TabLog.TextColor3     = (tab == "log")     and T.TEXT or T.TEXT_DIM
+    TabExecLog.TextColor3 = (tab == "execlog") and T.TEXT or T.TEXT_DIM
+end
+
+setTab("log")
+
+TabLog.MouseButton1Click:Connect(function()     setTab("log")     end)
+TabExecLog.MouseButton1Click:Connect(function() setTab("execlog") end)
+
+--------------------------------------------------------------------------------
+-- SEARCH
+--------------------------------------------------------------------------------
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    spy.filterText = SearchBox.Text
+    refreshFilter()
+end)
+
+--------------------------------------------------------------------------------
+-- EXEC LOG
+--------------------------------------------------------------------------------
+local execOrder = 0
+local function logExec(status, detail, remoteName)
+    execOrder = execOrder + 1
+    local row = Instance.new("Frame")
+    row.Size             = UDim2.new(1, 0, 0, 38)
+    row.BackgroundColor3 = T.BG3
+    row.BorderSizePixel  = 0
+    row.LayoutOrder      = execOrder
+    row.Parent           = ExecLogFrame
+    corner(row, 4)
+
+    local iconCol = (status == "ok") and T.GREEN or (status == "warn") and T.YELLOW or T.RED
+    local icon    = (status == "ok") and "✓" or (status == "warn") and "⚠" or "✕"
+
+    local iconLbl = lbl(row, icon, 14, iconCol, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    iconLbl.Size     = UDim2.fromOffset(28, 38)
+    iconLbl.Position = UDim2.fromOffset(4, 0)
+
+    local nameLbl3 = lbl(row, remoteName or "?", 12, T.TEXT, Enum.Font.GothamSemibold)
+    nameLbl3.Size     = UDim2.new(1, -100, 0, 18)
+    nameLbl3.Position = UDim2.fromOffset(34, 4)
+
+    local detailLbl = lbl(row, detail or "", 10, T.TEXT_DIM, Enum.Font.Code)
+    detailLbl.Size     = UDim2.new(1, -100, 0, 14)
+    detailLbl.Position = UDim2.fromOffset(34, 22)
+
+    local tsLbl2 = lbl(row, os.date("%H:%M:%S"), 9, T.TEXT_MUTED,
+        Enum.Font.Code, Enum.TextXAlignment.Right)
+    tsLbl2.Size     = UDim2.fromOffset(56, 38)
+    tsLbl2.Position = UDim2.new(1, -60, 0, 0)
+
+    ExecLogFrame.CanvasSize = UDim2.new(0, 0, 0, ExecLogLayout.AbsoluteContentSize.Y + 8)
+    ExecLogFrame.CanvasPosition = Vector2.new(0, math.huge)
+
+    -- Trim to MAX_EXEC_LOG
+    local rows = ExecLogFrame:GetChildren()
+    local count = 0
+    for _, c in ipairs(rows) do if c:IsA("Frame") then count = count + 1 end end
+    if count > MAX_EXEC_LOG then
+        for _, c in ipairs(ExecLogFrame:GetChildren()) do
+            if c:IsA("Frame") then c:Destroy() break end
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- SINGLE FIRE
+--------------------------------------------------------------------------------
+local function doFire(sel, code)
+    if not sel or not sel.remote or not sel.remote.Parent then
+        return false, "remote no longer exists"
+    end
+
+    -- Try loadstring first
+    local fn, lsErr = loadstring(code or generateCode(sel))
+    if fn then
+        local ok, runErr = pcall(fn)
+        if ok then
+            return true, "loadstring"
+        else
+            return false, "runtime: " .. tostring(runErr)
+        end
+    end
+
+    -- Direct fire fallback
+    local ok2, err2 = pcall(function()
+        if sel.remoteType == "RemoteFunction" then
+            sel.remote:InvokeServer(unsnap(sel.args))
+        else
+            sel.remote:FireServer(unsnap(sel.args))
+        end
+    end)
+    if ok2 then
+        return true, "direct (" .. (lsErr or "ls disabled") .. ")"
+    else
+        return false, "fire error: " .. tostring(err2)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- FIRE BUTTON
+--------------------------------------------------------------------------------
+FireBtn.MouseButton1Click:Connect(function()
+    local now = os.clock()
+    if now - spy.lastFire < FIRE_RATE_LIMIT then
+        setStatus("⚠ Rate limited.", T.YELLOW)
+        return
+    end
+    spy.lastFire = now
+
+    local sel = spy.selected
+    if not sel then
+        setStatus("⚠ No remote selected.", T.YELLOW)
+        return
+    end
+
+    -- Parse repeat/interval settings
+    local repeatN   = math.max(1, math.min(tonumber(RepeatBox.Text) or 1, 100))
+    local interval  = math.max(0, tonumber(IntervalBox.Text) or 0)
+    local loopMode  = spy.loopRunning
+
+    -- Stop loop if running
+    if spy.loopRunning and spy.loopConn then
+        spy.loopConn:Disconnect()
+        spy.loopConn    = nil
+        spy.loopRunning = false
+        LoopToggle.BackgroundColor3 = T.BG3
+        LoopToggle.TextColor3       = T.TEXT_DIM
+        setStatus("◼ Loop stopped.", T.TEXT_DIM)
+        return
+    end
+
+    -- Loop mode
+    if loopMode then
+        spy.loopRunning = true
+        LoopToggle.BackgroundColor3 = T.RED
+        LoopToggle.TextColor3       = Color3.new(1,1,1)
+        local code = CodeBox.Text
+        spy.loopConn = RunService.Heartbeat:Connect(function()
+            local ok, detail = doFire(sel, code)
+            if not ok then
+                spy.loopConn:Disconnect()
+                spy.loopConn    = nil
+                spy.loopRunning = false
+                LoopToggle.BackgroundColor3 = T.BG3
+                LoopToggle.TextColor3       = T.TEXT_DIM
+                setStatus("✕ Loop stopped: " .. detail, T.RED)
+                logExec("err", detail, sel.remote.Name)
+            end
+        end)
+        setStatus("↺ Loop firing: " .. sel.remote.Name, T.GREEN)
+        return
+    end
+
+    -- Repeat N times
+    local code = CodeBox.Text
+    local fired, failed = 0, 0
+
+    local function fireOnce()
+        local ok, detail = doFire(sel, code)
+        if ok then
+            fired = fired + 1
+        else
+            failed = failed + 1
+            logExec("err", detail, sel.remote.Name)
+        end
+    end
+
+    if interval <= 0 or repeatN == 1 then
+        for _ = 1, repeatN do fireOnce() end
+        local msg = "✓ Fired " .. repeatN .. "×"
+        if failed > 0 then msg = msg .. "  (" .. failed .. " failed)" end
+        setStatus(msg, failed > 0 and T.YELLOW or T.GREEN)
+        logExec(failed > 0 and "warn" or "ok",
+            "×" .. repeatN .. (failed > 0 and ("  " .. failed .. " failed") or ""),
+            sel.remote.Name)
+    else
+        local fires = 0
+        local function schedNext()
+            if fires >= repeatN then
+                local msg = "✓ Repeat done: " .. fired .. "/" .. repeatN
+                setStatus(msg, fired < repeatN and T.YELLOW or T.GREEN)
+                logExec(fired < repeatN and "warn" or "ok",
+                    "×" .. repeatN, sel.remote.Name)
+                return
+            end
+            fires = fires + 1
+            fireOnce()
+            task.delay(interval, schedNext)
+        end
+        schedNext()
+        setStatus("↺ Firing " .. repeatN .. "× at " .. interval .. "s interval…", T.BLUE)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- LOOP TOGGLE BUTTON
+--------------------------------------------------------------------------------
+local loopActive = false
+LoopToggle.MouseButton1Click:Connect(function()
+    loopActive = not loopActive
+    if loopActive then
+        LoopToggle.BackgroundColor3 = T.RED
+        LoopToggle.TextColor3       = Color3.new(1,1,1)
+        spy.loopRunning = true
+        setStatus("↺ Loop mode ON — press FIRE to start / stop", T.YELLOW)
+    else
+        LoopToggle.BackgroundColor3 = T.BG3
+        LoopToggle.TextColor3       = T.TEXT_DIM
+        spy.loopRunning = false
+        if spy.loopConn then
+            spy.loopConn:Disconnect()
+            spy.loopConn = nil
+        end
+        setStatus("◼ Loop mode OFF", T.TEXT_DIM)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- FIRE ALL SELECTED
+--------------------------------------------------------------------------------
+FireAllBtn.MouseButton1Click:Connect(function()
+    if spy.multiCount == 0 then
+        setStatus("⚠ Ctrl+Click entries to multi-select.", T.YELLOW)
+        return
+    end
+
+    local now = os.clock()
+    if now - spy.lastFire < FIRE_RATE_LIMIT then
+        setStatus("⚠ Rate limited.", T.YELLOW)
+        return
+    end
+    spy.lastFire = now
+
+    local delay   = math.max(0, tonumber(MultiDelayBox.Text) or 0)
+    local toFire  = {}
+    for e in pairs(spy.multiSel) do table.insert(toFire, e) end
+
+    local total, fired, failed, skipped = #toFire, 0, 0, 0
+
+    local function fireEntry(entry)
+        if not entry.remote or not entry.remote.Parent then
+            skipped = skipped + 1
+            logExec("warn", "remote gone", entry.remote and entry.remote.Name or "?")
+            return
+        end
+        local ok2, err2 = pcall(function()
+            if entry.remoteType == "RemoteFunction" then
+                entry.remote:InvokeServer(unsnap(entry.args))
+            else
+                entry.remote:FireServer(unsnap(entry.args))
+            end
+        end)
+        if ok2 then
+            fired = fired + 1
+            logExec("ok", "multi-fire", entry.remote.Name)
+        else
+            failed = failed + 1
+            logExec("err", tostring(err2), entry.remote.Name)
+        end
+    end
+
+    if delay <= 0 then
+        for _, e in ipairs(toFire) do task.spawn(fireEntry, e) end
+        task.delay(0.06, function()
+            setStatus(string.format("⚡ Multi-fired %d/%d  fail:%d  skip:%d",
+                fired, total, failed, skipped),
+                failed > 0 and T.YELLOW or T.GREEN)
+        end)
+    else
+        setStatus("⚡ Firing " .. total .. " with " .. delay .. "s delay…", T.BLUE)
+        local idx = 0
+        local function nextFire()
+            idx = idx + 1
+            if idx > #toFire then
+                setStatus(string.format("⚡ Multi-done %d/%d  fail:%d  skip:%d",
+                    fired, total, failed, skipped),
+                    failed > 0 and T.YELLOW or T.GREEN)
+                return
+            end
+            fireEntry(toFire[idx])
+            task.delay(delay, nextFire)
+        end
+        nextFire()
+    end
+
+    FireAllBtn.Text = "⚡  FIRING…"
+    task.delay(0.8, updateMultiBadge)
+end)
+
+--------------------------------------------------------------------------------
+-- DESELECT ALL
+--------------------------------------------------------------------------------
+DeselectBtn.MouseButton1Click:Connect(function()
+    clearMulti()
+    updateMultiBadge()
+    setStatus("── Deselected all.", T.TEXT_DIM)
+end)
+
+--------------------------------------------------------------------------------
+-- COPY
+--------------------------------------------------------------------------------
+CopyBtn.MouseButton1Click:Connect(function()
+    local txt = CodeBox.Text
+    if txt == "" then setStatus("⚠ Nothing to copy.", T.YELLOW) return end
+    local ok = false
+    if not ok then pcall(function() setclipboard(txt)   ok = true end) end
+    if not ok then pcall(function() writeclipboard(txt) ok = true end) end
+    if not ok then pcall(function() toclipboard(txt)    ok = true end) end
+    if ok then
+        local p = CopyBtn.Text
+        CopyBtn.Text = "✓  COPIED!"
+        task.delay(1.2, function() CopyBtn.Text = p end)
+        setStatus("✓ Copied to clipboard.", T.BLUE)
+    else
+        setStatus("✕ No clipboard API found.", T.RED)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- BLOCK
+--------------------------------------------------------------------------------
+BlockBtn.MouseButton1Click:Connect(function()
+    if spy.selected then
+        local name = spy.selected.remote.Name
+        spy.blocked[name] = true
+        local p = BlockBtn.Text
+        BlockBtn.Text = "⊘  BLOCKED!"
+        task.delay(1, function() BlockBtn.Text = "⊘  BLOCK REMOTE" end)
+        setStatus("⊘ Blocked: " .. name, T.ORANGE)
+    else
+        setStatus("⚠ Select a remote first.", T.YELLOW)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- CLEAR
+--------------------------------------------------------------------------------
+ClearBtn.MouseButton1Click:Connect(function()
+    for _, c in ipairs(LogFrame:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    spy.entries       = {}
+    spy.entryMap      = {}
+    spy.selected      = nil
+    spy.multiSel      = {}
+    spy.multiCount    = 0
+    spy.totalCalls    = 0
+    CodeBox.Text      = ""
+    updateCountLbl()
+    updateMultiBadge()
+    setStatus("── Logs cleared ──", T.TEXT_DIM)
+end)
+
+--------------------------------------------------------------------------------
+-- PAUSE BUTTON
+--------------------------------------------------------------------------------
+PauseBtn.MouseButton1Click:Connect(function()
+    spy.paused = not spy.paused
+    if spy.paused then
+        PauseBtn.Text              = "▶"
+        PausedBadge.Visible        = true
+        StatusDot.BackgroundColor3 = T.ORANGE
+        setStatus("⏸ Paused — no new events will be logged.", T.ORANGE)
+    else
+        PauseBtn.Text              = "⏸"
+        PausedBadge.Visible        = false
+        StatusDot.BackgroundColor3 = T.GREEN
+        setStatus("▶ Resumed.", T.GREEN)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- MINIMIZE
+--------------------------------------------------------------------------------
+local isMin = false
+MinBtn.MouseButton1Click:Connect(function()
+    isMin = not isMin
+    if isMin then
+        tweenProp(Main, {Size = UDim2.fromOffset(WIN_W, 40)}, 0.2)
+        MinBtn.Text = "□"
+        Body.Visible    = false
+        TabBar.Visible  = false
+    else
+        Body.Visible    = true
+        TabBar.Visible  = true
+        tweenProp(Main, {Size = UDim2.fromOffset(WIN_W, WIN_H)}, 0.2)
+        MinBtn.Text = "─"
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- KEYBOARD SHORTCUTS
+--------------------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+             or  UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+
+    -- Ctrl+A — select all visible entries
+    if ctrl and input.KeyCode == Enum.KeyCode.A then
+        clearMulti()
+        for _, e in ipairs(spy.entries) do
+            if e.btn and e.btn.Parent and e.btn.Visible then
+                addMulti(e)
+                e.btn.BackgroundColor3 = T.ENTRY_MULTI
+            end
+        end
+        updateMultiBadge()
+        setStatus("⚡ Selected all " .. spy.multiCount .. " visible entries", T.BLUE)
+
+    -- Ctrl+D — deselect all
+    elseif ctrl and input.KeyCode == Enum.KeyCode.D then
+        clearMulti()
+        updateMultiBadge()
+        setStatus("── Deselected all.", T.TEXT_DIM)
+
+    -- Delete — block selected
+    elseif input.KeyCode == Enum.KeyCode.Delete and spy.selected then
+        local name = spy.selected.remote.Name
+        spy.blocked[name] = true
+        if spy.selected.btn and spy.selected.btn.Parent then
+            spy.selected.btn:Destroy()
+        end
+        for i, e in ipairs(spy.entries) do
+            if e == spy.selected then table.remove(spy.entries, i) break end
+        end
+        spy.selected = nil
+        CodeBox.Text = ""
+        setStatus("⊘ Blocked (Delete): " .. name, T.ORANGE)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- DIVIDER DRAG (resize panels)
+--------------------------------------------------------------------------------
+local divDragging = false
+local divDragStart = 0
+local divStartW    = logPanelW
+
+DivHandle.MouseButton1Down:Connect(function()
+    divDragging  = true
+    divDragStart = UserInputService:GetMouseLocation().X
+    divStartW    = LogPanel.AbsoluteSize.X
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        divDragging = false
+    end
+end)
+
+RunService.RenderStepped:Connect(function()
+    if not divDragging then return end
+    local mx  = UserInputService:GetMouseLocation().X
+    local dx  = mx - divDragStart
+    local newW = math.clamp(divStartW + dx, 250, WIN_W - 220)
+    LogPanel.Size     = UDim2.new(0, newW, 1, 0)
+    Divider.Position  = UDim2.fromOffset(newW, 0)
+    CtrlPanel.Size    = UDim2.new(1, -(newW + 5), 1, 0)
+    CtrlPanel.Position = UDim2.fromOffset(newW + 5, 0)
+end)
+
+--------------------------------------------------------------------------------
+-- HOOK ENGINE
+--------------------------------------------------------------------------------
+local function hookRemote(obj)
+    if not obj or not obj.Parent then return end
+    if spy.hooked[obj] then return end
+
+    if obj:IsA("RemoteEvent") then
+        spy.hooked[obj] = true
+        local ok, err = pcall(function()
+            obj.OnClientEvent:Connect(function(...)
+                if obj and obj.Parent then
+                    addLog(obj, snap(...), "RemoteEvent")
+                end
+            end)
+        end)
+        if not ok then
+            spy.hooked[obj] = nil
+            warn("[RemoteSpy v5] RemoteEvent hook failed: "
+                .. obj:GetFullName() .. " | " .. tostring(err))
+        end
+
+    elseif obj:IsA("RemoteFunction") then
+        spy.hooked[obj] = true
+        local ok, err = pcall(function()
+            obj.OnClientInvoke = function(...)
+                if obj and obj.Parent then
+                    addLog(obj, snap(...), "RemoteFunction")
+                end
+            end
+        end)
+        if not ok then
+            spy.hooked[obj] = nil
+            warn("[RemoteSpy v5] RemoteFunction hook failed: "
+                .. obj:GetFullName() .. " | " .. tostring(err))
+        end
+    end
+end
+
+-- Initial scan
+local hookedCount = 0
+for _, v in ipairs(game:GetDescendants()) do
+    local wasHooked = not spy.hooked[v]
+    hookRemote(v)
+    if not wasHooked and spy.hooked[v] then hookedCount = hookedCount + 1 end
+end
+print(string.format("[RemoteSpy v5] Hooked %d existing remotes.", hookedCount))
+
+-- Watch for new remotes
+game.DescendantAdded:Connect(function(obj)
+    task.defer(function()
+        hookRemote(obj)
+    end)
+end)
+
+-- Allow re-hook if remote moves in the hierarchy
+game.DescendantRemoving:Connect(function(obj)
+    if spy.hooked[obj] then
+        spy.hooked[obj] = nil
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- STARTUP
+--------------------------------------------------------------------------------
+setStatus("◉ Active — waiting for RemoteEvent / RemoteFunction calls.", T.GREEN)
+print("[RemoteSpy v5.0] Ready.")
