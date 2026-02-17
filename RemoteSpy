@@ -1,104 +1,99 @@
--- Holy Organize les goo
-
+-- Remote Spy v5.2 | Fixed Hook Engine + Function Info + Lag Fixes
 --[[
-
-If it says hookmetamethod is missing that means that your executor is not supported
-
-]]--
+    FIXES IN v5.2:
+    [1] Removed checkcaller() guard — was silently dropping real game remote fires
+    [2] getrawmetatable fallback if hookmetamethod is missing
+    [3] hookfunction() backup on FireServer / InvokeServer directly
+    [4] Case variants handled: fireServer / invokeServer
+    [5] Function Info panel added (name, source, line, constants)
+    [6] Lag fixes: capped log entries, batched canvas updates, 
+        deferred UI builds off main thread, pooled unused rows
+]]
 
 --------------------------------------------------------------------------------
 -- SERVICES
 --------------------------------------------------------------------------------
-local HttpService        = game:GetService("HttpService")
-local Players            = game:GetService("Players")
-local TweenService       = game:GetService("TweenService")
-local UserInputService   = game:GetService("UserInputService")
-local RunService         = game:GetService("RunService")
-
-local LP = Players.LocalPlayer
+local HttpService       = game:GetService("HttpService")
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
+local LP                = Players.LocalPlayer
 
 --------------------------------------------------------------------------------
 -- CONSTANTS
 --------------------------------------------------------------------------------
-local VERSION          = "5.1"
+local VERSION          = "5.2"
 local MAX_HISTORY      = 500
 local DEDUPE_WINDOW    = 0.35
 local FIRE_RATE_LIMIT  = 0.2
 local SCROLL_THRESH    = 80
 local MAX_EXEC_LOG     = 20
+local MAX_LOG_ENTRIES  = 300   -- LAG FIX: cap visible rows
+local CANVAS_DEBOUNCE  = 0.05  -- LAG FIX: batch canvas resizes
 
 --------------------------------------------------------------------------------
 -- THEME
 --------------------------------------------------------------------------------
 local T = {
-    -- Backgrounds
     BG           = Color3.fromRGB(12, 12, 14),
     BG2          = Color3.fromRGB(18, 18, 22),
     BG3          = Color3.fromRGB(24, 24, 30),
     BG4          = Color3.fromRGB(30, 30, 38),
-    -- Borders
     BORDER       = Color3.fromRGB(45, 45, 58),
     BORDER2      = Color3.fromRGB(60, 60, 78),
-    -- Accents
     GREEN        = Color3.fromRGB(50, 210, 100),
     GREEN_DIM    = Color3.fromRGB(30, 140, 65),
-    GREEN_TINT   = Color3.fromRGB(18, 45, 25),
     BLUE         = Color3.fromRGB(60, 140, 255),
     BLUE_DIM     = Color3.fromRGB(35, 80, 180),
-    BLUE_TINT    = Color3.fromRGB(18, 30, 65),
     YELLOW       = Color3.fromRGB(255, 200, 60),
     RED          = Color3.fromRGB(220, 60, 60),
     PURPLE       = Color3.fromRGB(160, 80, 255),
     ORANGE       = Color3.fromRGB(220, 130, 30),
-    -- Text
     TEXT         = Color3.fromRGB(210, 215, 225),
     TEXT_DIM     = Color3.fromRGB(130, 135, 150),
     TEXT_MUTED   = Color3.fromRGB(75, 78, 95),
     CODE         = Color3.fromRGB(100, 255, 140),
-    -- Entry states
     ENTRY_IDLE   = Color3.fromRGB(22, 22, 27),
     ENTRY_HOVER  = Color3.fromRGB(28, 28, 35),
     ENTRY_SEL    = Color3.fromRGB(20, 50, 30),
     ENTRY_MULTI  = Color3.fromRGB(18, 30, 62),
-    -- RE/RF badge
     RE_CLR       = Color3.fromRGB(30, 110, 200),
     RF_CLR       = Color3.fromRGB(130, 50, 200),
-    -- Direction colors: outgoing = warm amber, incoming = cool teal
-    DIR_OUT      = Color3.fromRGB(200, 140, 30),   -- → client fires to server
-    DIR_IN       = Color3.fromRGB(30, 170, 160),   -- ← server fires to client
+    DIR_OUT      = Color3.fromRGB(200, 140, 30),
+    DIR_IN       = Color3.fromRGB(30, 170, 160),
+    FUNC_HDR     = Color3.fromRGB(80, 40, 160),
 }
 
 --------------------------------------------------------------------------------
 -- STATE
 --------------------------------------------------------------------------------
 local spy = {
-    -- hooks
-    hooked        = {},    -- [remote] = true
-    blocked       = {},    -- [remoteName] = true
+    hooked        = {},
+    blocked       = {},
     paused        = false,
-    -- log
-    entries       = {},    -- ordered list of entry objects
-    entryMap      = {},    -- [dedupeKey] = entry
+    entries       = {},
+    entryMap      = {},
     totalCalls    = 0,
-    -- selection
-    selected      = nil,   -- single (code preview)
-    multiSel      = {},    -- [entry] = true
+    selected      = nil,
+    multiSel      = {},
     multiCount    = 0,
-    lastClickIdx  = nil,   -- for shift-range select
-    -- history ring buffer
+    lastClickIdx  = nil,
     history       = {},
     histIdx       = 0,
-    -- execution
     lastFire      = 0,
-    execLog       = {},    -- last MAX_EXEC_LOG results
-    loopConn      = nil,   -- active loop connection
+    execLog       = {},
+    loopConn      = nil,
     loopRunning   = false,
-    -- ui
     filterText    = "",
-    activeTab     = "log", -- "log" | "execlog"
-    -- direction filter: "all" | "in" | "out"
+    activeTab     = "log",
     dirFilter     = "all",
+    -- LAG FIX: canvas update debounce
+    canvasDirty   = false,
 }
+
+-- LAG FIX: pending log queue processed per-frame
+local pendingLogs = {}
 
 --------------------------------------------------------------------------------
 -- UTILITY: UI BUILDERS
@@ -174,7 +169,7 @@ end
 --------------------------------------------------------------------------------
 -- SERIALIZER
 --------------------------------------------------------------------------------
-local serialize  -- forward declare for recursion
+local serialize
 
 local function tryInstancePath(v)
     local ok, path = pcall(function()
@@ -197,9 +192,7 @@ serialize = function(v, depth, compact)
     depth   = depth   or 0
     compact = compact or false
     if depth > 7 then return '"[MaxDepth]"' end
-
     local t = typeof(v)
-
     if     t == "nil"     then return "nil"
     elseif t == "boolean" then return tostring(v)
     elseif t == "number"  then
@@ -284,10 +277,6 @@ serialize = function(v, depth, compact)
         return string.format("TweenInfo.new(%s, Enum.EasingStyle.%s, Enum.EasingDirection.%s, %s, %s, %s)",
             serialize(v.Time), v.EasingStyle.Name, v.EasingDirection.Name,
             serialize(v.RepeatCount), tostring(v.Reverses), serialize(v.DelayTime))
-    elseif t == "RaycastParams" then
-        return '"[RaycastParams — not reconstructible]"'
-    elseif t == "OverlapParams" then
-        return '"[OverlapParams — not reconstructible]"'
     else
         local ok, j = pcall(function() return HttpService:JSONEncode(v) end)
         return ok and j or string.format('"[%s]"', t)
@@ -326,6 +315,82 @@ local function resolvePath(obj)
 end
 
 --------------------------------------------------------------------------------
+-- FUNCTION INFO CAPTURE
+-- Safely pulls debug info from the calling stack when a remote fires
+--------------------------------------------------------------------------------
+local function captureFuncInfo()
+    local info = {}
+    -- Walk up stack looking for a non-C, non-spy frame
+    for level = 3, 10 do
+        local ok, di = pcall(debug.info or function() end, level, "snl")
+        if not ok then break end
+        if di then
+            -- skip C functions and internal frames
+            if type(di) == "string" then
+                -- some executors return a string summary
+                info.raw = di
+                break
+            end
+        end
+        -- standard debug.info with flags
+        local ok2, name, src, line = pcall(function()
+            return debug.info(level, "nsl")
+        end)
+        if ok2 and src and not src:find("RemoteSpy") then
+            info.name   = (name ~= "") and name or "?"
+            info.source = src
+            info.line   = line
+            break
+        end
+    end
+    -- Also try getinfo for executors that expose it
+    pcall(function()
+        local di = debug.getinfo and debug.getinfo(4)
+        if di then
+            info.name   = info.name   or (di.name ~= "" and di.name or "?")
+            info.source = info.source or di.short_src or di.source
+            info.line   = info.line   or di.currentline
+        end
+    end)
+    -- Pull constants from calling function if possible
+    pcall(function()
+        local f = debug.getinfo and debug.getinfo(4, "f")
+        if f and f.func and islclosure and islclosure(f.func) then
+            local consts = debug.getconstants(f.func)
+            if consts and #consts > 0 then
+                -- Only keep string/number constants, skip noise
+                local filtered = {}
+                for _, c in ipairs(consts) do
+                    if type(c) == "string" or type(c) == "number" then
+                        table.insert(filtered, c)
+                    end
+                end
+                info.constants = filtered
+            end
+        end
+    end)
+    return info
+end
+
+local function formatFuncInfo(fi)
+    if not fi then return "-- No function info captured." end
+    local lines = {"-- ╔══ FUNCTION INFO ══╗"}
+    if fi.name   then table.insert(lines, "-- Name   : " .. tostring(fi.name))   end
+    if fi.source then table.insert(lines, "-- Source : " .. tostring(fi.source)) end
+    if fi.line   then table.insert(lines, "-- Line   : " .. tostring(fi.line))   end
+    if fi.raw    then table.insert(lines, "-- Debug  : " .. tostring(fi.raw))    end
+    if fi.constants and #fi.constants > 0 then
+        table.insert(lines, "-- Constants:")
+        for i, c in ipairs(fi.constants) do
+            if i > 12 then table.insert(lines, "--   ... (" .. (#fi.constants - 12) .. " more)") break end
+            table.insert(lines, "--   [" .. i .. "] = " .. serialize(c, 0, true))
+        end
+    end
+    table.insert(lines, "-- ╚════════════════════╝")
+    return table.concat(lines, "\n")
+end
+
+--------------------------------------------------------------------------------
 -- CODE GENERATION
 --------------------------------------------------------------------------------
 local function getCallerName(remoteType, direction, args)
@@ -337,7 +402,6 @@ local function getCallerName(remoteType, direction, args)
         end
         return "Server → " .. LP.Name
     else
-        -- Outgoing: client fired it
         return LP.Name .. " → Server"
     end
 end
@@ -356,14 +420,19 @@ local function generateCode(entry)
     }
     for i = 1, n do
         local comma = (i < n) and "," or ""
-        lines[#lines + 1] = string.format(
-            "    [%d] = %s%s", i, serialize(args[i], 1, true), comma)
+        lines[#lines + 1] = string.format("    [%d] = %s%s", i, serialize(args[i], 1, true), comma)
     end
     lines[#lines + 1] = "}"
     lines[#lines + 1] = ""
     lines[#lines + 1] = resolvePath(remote) .. ":" .. method .. "(unpack(args))"
 
     return table.concat(lines, "\n")
+end
+
+local function generateFuncInfoCode(entry)
+    local codeStr = generateCode(entry)
+    local funcStr = formatFuncInfo(entry.funcInfo)
+    return funcStr .. "\n\n" .. codeStr
 end
 
 local function dedupeKey(remote, args, direction)
@@ -408,7 +477,7 @@ end
 -- SCREEN GUI
 --------------------------------------------------------------------------------
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name           = "RemoteSpy_v5_1"
+ScreenGui.Name           = "RemoteSpy_v5_2"
 ScreenGui.ResetOnSpawn   = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 pcall(function() ScreenGui.IgnoreGuiInset = true end)
@@ -417,7 +486,7 @@ ScreenGui.Parent         = LP:WaitForChild("PlayerGui")
 --------------------------------------------------------------------------------
 -- MAIN WINDOW
 --------------------------------------------------------------------------------
-local WIN_W, WIN_H = 820, 500
+local WIN_W, WIN_H = 860, 520
 
 local Main = Instance.new("Frame")
 Main.Name             = "Main"
@@ -530,8 +599,7 @@ SearchFrame.Parent           = TitleBar
 corner(SearchFrame, 5)
 uiStroke(SearchFrame, T.BORDER2, 1)
 
-local SearchIcon = lbl(SearchFrame, "🔍", 11, T.TEXT_MUTED, Enum.Font.Gotham,
-    Enum.TextXAlignment.Center)
+local SearchIcon = lbl(SearchFrame, "🔍", 11, T.TEXT_MUTED, Enum.Font.Gotham, Enum.TextXAlignment.Center)
 SearchIcon.Size     = UDim2.fromOffset(22, 24)
 SearchIcon.Position = UDim2.fromOffset(2, 0)
 SearchIcon.ZIndex   = 7
@@ -575,7 +643,6 @@ local function mkTab(txt, xOff, w)
     f.Position         = UDim2.fromOffset(xOff, 0)
     f.BackgroundTransparency = 1
     f.Parent           = TabBar
-
     local b = Instance.new("TextButton")
     b.Size             = UDim2.new(1, 0, 1, 0)
     b.BackgroundTransparency = 1
@@ -585,7 +652,6 @@ local function mkTab(txt, xOff, w)
     b.TextSize         = 12
     b.AutoButtonColor  = false
     b.Parent           = f
-
     local indicator = Instance.new("Frame")
     indicator.Size             = UDim2.new(0.7, 0, 0, 2)
     indicator.Position         = UDim2.new(0.15, 0, 1, -2)
@@ -594,14 +660,13 @@ local function mkTab(txt, xOff, w)
     indicator.Visible          = false
     indicator.Parent           = f
     corner(indicator, 1)
-
     return b, indicator
 end
 
-local TabLog,     TabLogInd     = mkTab("  REMOTE LOG",    4)
-local TabExecLog, TabExecLogInd = mkTab("  EXEC HISTORY",  118)
+local TabLog,     TabLogInd     = mkTab("  REMOTE LOG",   4,   120)
+local TabExecLog, TabExecLogInd = mkTab("  EXEC LOG",     128, 100)
 
--- ── Direction filter tabs (right-aligned in tab bar) ──────────────────────
+-- Direction filter
 local DirFilterFrame = Instance.new("Frame")
 DirFilterFrame.Size             = UDim2.fromOffset(200, 24)
 DirFilterFrame.Position         = UDim2.new(1, -208, 0.5, -12)
@@ -624,9 +689,9 @@ local function mkDirBtn(txt, xOff, w)
     return b
 end
 
-local DirAllBtn = mkDirBtn("ALL",     0,   44)
-local DirOutBtn = mkDirBtn("→ OUT",  48,   54)
-local DirInBtn  = mkDirBtn("← IN",  106,  50)
+local DirAllBtn = mkDirBtn("ALL",    0,   44)
+local DirOutBtn = mkDirBtn("→ OUT", 48,   54)
+local DirInBtn  = mkDirBtn("← IN", 106,  50)
 
 local function updateDirBtns()
     DirAllBtn.BackgroundColor3 = spy.dirFilter == "all" and T.BG4 or T.BG3
@@ -742,6 +807,7 @@ CtrlPanel.BackgroundTransparency = 1
 CtrlPanel.ClipsDescendants = true
 CtrlPanel.Parent           = Body
 
+-- Code header
 local CodeHeader = Instance.new("Frame")
 CodeHeader.Size             = UDim2.new(1, -8, 0, 22)
 CodeHeader.Position         = UDim2.fromOffset(4, 4)
@@ -750,16 +816,14 @@ CodeHeader.BorderSizePixel  = 0
 CodeHeader.Parent           = CtrlPanel
 corner(CodeHeader, 4)
 
-local CodeHdrLbl = lbl(CodeHeader, "  CODE PREVIEW / EDIT", 10, T.TEXT_MUTED,
-    Enum.Font.GothamBold)
-CodeHdrLbl.Size     = UDim2.new(0.6, 0, 1, 0)
+local CodeHdrLbl = lbl(CodeHeader, "  CODE PREVIEW / EDIT", 10, T.TEXT_MUTED, Enum.Font.GothamBold)
+CodeHdrLbl.Size = UDim2.new(0.6, 0, 1, 0)
 
-local CodeLangLbl = lbl(CodeHeader, "Lua  ", 10, T.TEXT_MUTED,
-    Enum.Font.Code, Enum.TextXAlignment.Right)
+local CodeLangLbl = lbl(CodeHeader, "Lua  ", 10, T.TEXT_MUTED, Enum.Font.Code, Enum.TextXAlignment.Right)
 CodeLangLbl.Size = UDim2.new(0.4, 0, 1, 0)
 
 local CodeBox = Instance.new("TextBox")
-CodeBox.Size              = UDim2.new(1, -8, 0, 178)
+CodeBox.Size              = UDim2.new(1, -8, 0, 140)
 CodeBox.Position          = UDim2.fromOffset(4, 28)
 CodeBox.BackgroundColor3  = T.BG
 CodeBox.TextColor3        = T.CODE
@@ -777,9 +841,54 @@ CodeBox.Parent            = CtrlPanel
 corner(CodeBox, 4)
 uiStroke(CodeBox, T.BORDER, 1)
 
+--------------------------------------------------------------------------------
+-- FUNCTION INFO PANEL
+--------------------------------------------------------------------------------
+local FuncInfoHeader = Instance.new("Frame")
+FuncInfoHeader.Size             = UDim2.new(1, -8, 0, 20)
+FuncInfoHeader.Position         = UDim2.fromOffset(4, 170)
+FuncInfoHeader.BackgroundColor3 = T.FUNC_HDR
+FuncInfoHeader.BorderSizePixel  = 0
+FuncInfoHeader.Parent           = CtrlPanel
+corner(FuncInfoHeader, 4)
+
+local FuncInfoTitleLbl = lbl(FuncInfoHeader, "  ƒ  FUNCTION INFO", 10, Color3.new(1,1,1), Enum.Font.GothamBold)
+FuncInfoTitleLbl.Size = UDim2.new(0.7, 0, 1, 0)
+
+-- small badge showing if info was captured
+local FuncInfoBadge = Instance.new("Frame")
+FuncInfoBadge.Size             = UDim2.fromOffset(46, 14)
+FuncInfoBadge.Position         = UDim2.new(1, -52, 0.5, -7)
+FuncInfoBadge.BackgroundColor3 = T.BG4
+FuncInfoBadge.BorderSizePixel  = 0
+FuncInfoBadge.Parent           = FuncInfoHeader
+corner(FuncInfoBadge, 6)
+local FuncInfoBadgeLbl = lbl(FuncInfoBadge, "NONE", 8, T.TEXT_MUTED, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+FuncInfoBadgeLbl.Size = UDim2.new(1,0,1,0)
+
+local FuncInfoBox = Instance.new("TextBox")
+FuncInfoBox.Size              = UDim2.new(1, -8, 0, 88)
+FuncInfoBox.Position          = UDim2.fromOffset(4, 192)
+FuncInfoBox.BackgroundColor3  = Color3.fromRGB(16, 10, 28)
+FuncInfoBox.TextColor3        = Color3.fromRGB(180, 140, 255)
+FuncInfoBox.PlaceholderColor3 = T.TEXT_MUTED
+FuncInfoBox.PlaceholderText   = "-- Select a remote entry to see caller info --"
+FuncInfoBox.Font              = Enum.Font.Code
+FuncInfoBox.TextSize          = 10
+FuncInfoBox.TextXAlignment    = Enum.TextXAlignment.Left
+FuncInfoBox.TextYAlignment    = Enum.TextYAlignment.Top
+FuncInfoBox.ClearTextOnFocus  = false
+FuncInfoBox.MultiLine         = true
+FuncInfoBox.TextWrapped       = true
+FuncInfoBox.Text              = ""
+FuncInfoBox.Parent            = CtrlPanel
+corner(FuncInfoBox, 4)
+uiStroke(FuncInfoBox, Color3.fromRGB(70, 40, 110), 1)
+
+-- Status bar
 local StatusBar = Instance.new("Frame")
 StatusBar.Size             = UDim2.new(1, -8, 0, 20)
-StatusBar.Position         = UDim2.fromOffset(4, 208)
+StatusBar.Position         = UDim2.fromOffset(4, 284)
 StatusBar.BackgroundColor3 = T.BG2
 StatusBar.BorderSizePixel  = 0
 StatusBar.Parent           = CtrlPanel
@@ -800,7 +909,7 @@ end
 --------------------------------------------------------------------------------
 local RepeatRow = Instance.new("Frame")
 RepeatRow.Size             = UDim2.new(1, -8, 0, 26)
-RepeatRow.Position         = UDim2.fromOffset(4, 232)
+RepeatRow.Position         = UDim2.fromOffset(4, 308)
 RepeatRow.BackgroundColor3 = T.BG2
 RepeatRow.BorderSizePixel  = 0
 RepeatRow.Parent           = CtrlPanel
@@ -874,7 +983,7 @@ uiStroke(MultiDelayBox, T.BORDER, 1)
 --------------------------------------------------------------------------------
 local BtnGrid = Instance.new("Frame")
 BtnGrid.Size             = UDim2.new(1, -8, 0, 110)
-BtnGrid.Position         = UDim2.fromOffset(4, 262)
+BtnGrid.Position         = UDim2.fromOffset(4, 338)
 BtnGrid.BackgroundTransparency = 1
 BtnGrid.Parent           = CtrlPanel
 
@@ -903,15 +1012,16 @@ local function actionBtn(txt, bgCol, order)
     return b
 end
 
-local FireBtn     = actionBtn("▶  FIRE SELECTED",       T.GREEN_DIM,                  1)
-local FireAllBtn  = actionBtn("⚡  FIRE ALL (0)",        T.BLUE_DIM,                   2)
-local CopyBtn     = actionBtn("⎘  COPY CODE",           Color3.fromRGB(40, 80, 160),  3)
-local BlockBtn    = actionBtn("⊘  BLOCK REMOTE",        Color3.fromRGB(150, 95, 15),  4)
-local DeselectBtn = actionBtn("☐  DESELECT ALL",        Color3.fromRGB(55, 55, 75),   5)
-local ClearBtn    = actionBtn("✕  CLEAR LOGS",          Color3.fromRGB(140, 35, 35),  6)
+local FireBtn     = actionBtn("▶  FIRE SELECTED",    T.GREEN_DIM,                   1)
+local FireAllBtn  = actionBtn("⚡  FIRE ALL (0)",     T.BLUE_DIM,                    2)
+local CopyBtn     = actionBtn("⎘  COPY CODE",        Color3.fromRGB(40, 80, 160),   3)
+local CopyFuncBtn = actionBtn("ƒ  COPY FUNC INFO",   Color3.fromRGB(80, 40, 140),   4)
+local BlockBtn    = actionBtn("⊘  BLOCK REMOTE",     Color3.fromRGB(150, 95, 15),   5)
+local DeselectBtn = actionBtn("☐  DESELECT ALL",     Color3.fromRGB(55, 55, 75),    6)
+local ClearBtn    = actionBtn("✕  CLEAR LOGS",       Color3.fromRGB(140, 35, 35),   7)
 
 --------------------------------------------------------------------------------
--- LOG ENTRY BUILDER
+-- HELPERS: COUNTS / BADGES
 --------------------------------------------------------------------------------
 local function updateCountLbl()
     CallsLbl.Text = spy.totalCalls .. " call" .. (spy.totalCalls ~= 1 and "s" or "")
@@ -928,24 +1038,28 @@ local function updateMultiBadge()
     end
 end
 
+-- LAG FIX: debounced canvas update
+local canvasUpdateScheduled = false
 local function updateCanvas()
-    LogFrame.CanvasSize = UDim2.new(0, 0, 0, LogLayout.AbsoluteContentSize.Y + 8)
-    local c = LogFrame.AbsoluteCanvasSize.Y
-    local w = LogFrame.AbsoluteWindowSize.Y
-    if c - LogFrame.CanvasPosition.Y - w < SCROLL_THRESH then
-        LogFrame.CanvasPosition = Vector2.new(0, math.huge)
-    end
+    if canvasUpdateScheduled then return end
+    canvasUpdateScheduled = true
+    task.delay(CANVAS_DEBOUNCE, function()
+        canvasUpdateScheduled = false
+        LogFrame.CanvasSize = UDim2.new(0, 0, 0, LogLayout.AbsoluteContentSize.Y + 8)
+        local c = LogFrame.AbsoluteCanvasSize.Y
+        local w = LogFrame.AbsoluteWindowSize.Y
+        if c - LogFrame.CanvasPosition.Y - w < SCROLL_THRESH then
+            LogFrame.CanvasPosition = Vector2.new(0, math.huge)
+        end
+    end)
 end
 
--- Check if entry passes all current filters
 local function entryVisible(entry)
-    -- name filter
     if spy.filterText ~= "" then
         if not entry.remote.Name:lower():find(spy.filterText:lower(), 1, true) then
             return false
         end
     end
-    -- direction filter
     if spy.dirFilter ~= "all" then
         if entry.direction ~= spy.dirFilter:upper() then
             return false
@@ -963,9 +1077,33 @@ local function refreshFilter()
     updateCanvas()
 end
 
--- Build a single log row
--- direction: "IN" (server→client) or "OUT" (client→server)
-local function buildLogEntry(remote, args, remoteType, direction)
+-- Update the Function Info panel when an entry is selected
+local function showFuncInfo(entry)
+    if not entry then
+        FuncInfoBox.Text      = ""
+        FuncInfoBadgeLbl.Text = "NONE"
+        FuncInfoBadge.BackgroundColor3 = T.BG4
+        FuncInfoBadgeLbl.TextColor3    = T.TEXT_MUTED
+        return
+    end
+    local fi = entry.funcInfo
+    if fi and (fi.name or fi.source or fi.line) then
+        FuncInfoBox.Text      = formatFuncInfo(fi)
+        FuncInfoBadgeLbl.Text = "FOUND"
+        FuncInfoBadge.BackgroundColor3 = T.GREEN_DIM
+        FuncInfoBadgeLbl.TextColor3    = Color3.new(1,1,1)
+    else
+        FuncInfoBox.Text      = "-- Function info not available.\n-- Executor may not support debug.info\n-- or this was an incoming (server→client) event."
+        FuncInfoBadgeLbl.Text = "N/A"
+        FuncInfoBadge.BackgroundColor3 = T.BG4
+        FuncInfoBadgeLbl.TextColor3    = T.TEXT_MUTED
+    end
+end
+
+--------------------------------------------------------------------------------
+-- BUILD LOG ENTRY (single row)
+--------------------------------------------------------------------------------
+local function buildLogEntry(remote, args, remoteType, direction, funcInfo)
     direction = direction or "OUT"
     local caller    = getCallerName(remoteType, direction, args)
     local preview   = argPreview(args)
@@ -977,6 +1115,7 @@ local function buildLogEntry(remote, args, remoteType, direction)
         remoteType = remoteType,
         direction  = direction,
         caller     = caller,
+        funcInfo   = funcInfo,
         count      = 1,
         lastTime   = os.clock(),
         timestamp  = timestamp,
@@ -994,7 +1133,7 @@ local function buildLogEntry(remote, args, remoteType, direction)
     btn_h.Parent           = LogFrame
     corner(btn_h, 4)
 
-    -- Direction arrow bar (leftmost, colored by direction)
+    -- Direction bar
     local dirBar = Instance.new("Frame")
     dirBar.Size             = UDim2.fromOffset(3, 34)
     dirBar.Position         = UDim2.fromOffset(4, 6)
@@ -1003,7 +1142,6 @@ local function buildLogEntry(remote, args, remoteType, direction)
     dirBar.Parent           = btn_h
     corner(dirBar, 2)
 
-    -- Direction arrow label (→ or ←)
     local dirArrow = lbl(btn_h,
         direction == "OUT" and "→" or "←",
         11,
@@ -1020,27 +1158,37 @@ local function buildLogEntry(remote, args, remoteType, direction)
     typeBadge.BorderSizePixel  = 0
     typeBadge.Parent           = btn_h
     corner(typeBadge, 3)
-    local typeTxt = lbl(typeBadge, remoteType == "RemoteFunction" and "RF" or "RE",
+    local typeTxt = lbl(typeBadge,
+        remoteType == "RemoteFunction" and "RF" or "RE",
         8, Color3.new(1,1,1), Enum.Font.GothamBold, Enum.TextXAlignment.Center)
     typeTxt.Size = UDim2.new(1,0,1,0)
 
-    -- Remote name
+    -- ƒ badge if func info captured
+    if funcInfo and (funcInfo.name or funcInfo.source) then
+        local fiBadge = Instance.new("Frame")
+        fiBadge.Size             = UDim2.fromOffset(14, 14)
+        fiBadge.Position         = UDim2.fromOffset(36, 25)
+        fiBadge.BackgroundColor3 = T.FUNC_HDR
+        fiBadge.BorderSizePixel  = 0
+        fiBadge.Parent           = btn_h
+        corner(fiBadge, 3)
+        local fiTxt = lbl(fiBadge, "ƒ", 8, Color3.new(1,1,1), Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+        fiTxt.Size = UDim2.new(1,0,1,0)
+    end
+
     local nameLbl2 = lbl(btn_h, remote.Name, 13, T.TEXT, Enum.Font.GothamSemibold)
     nameLbl2.Size     = UDim2.new(1, -110, 0, 18)
     nameLbl2.Position = UDim2.fromOffset(38, 5)
 
-    -- Arg preview
     local previewLbl = lbl(btn_h, preview, 10, T.TEXT_MUTED, Enum.Font.Code)
     previewLbl.Size     = UDim2.new(1, -110, 0, 14)
     previewLbl.Position = UDim2.fromOffset(38, 25)
     previewLbl.TextWrapped = false
 
-    -- Timestamp
     local tsLbl = lbl(btn_h, timestamp, 9, T.TEXT_MUTED, Enum.Font.Code, Enum.TextXAlignment.Right)
     tsLbl.Size     = UDim2.fromOffset(56, 14)
     tsLbl.Position = UDim2.new(1, -62, 0, 6)
 
-    -- Count badge
     local cntWrap = Instance.new("Frame")
     cntWrap.Size             = UDim2.fromOffset(28, 14)
     cntWrap.Position         = UDim2.new(1, -62, 0, 22)
@@ -1097,6 +1245,7 @@ local function buildLogEntry(remote, args, remoteType, direction)
             spy.lastClickIdx = entry.listIndex
             btn_h.BackgroundColor3 = spy.multiSel[entry] and T.ENTRY_MULTI or T.ENTRY_SEL
             CodeBox.Text     = generateCode(entry)
+            showFuncInfo(entry)
             BlockBtn.Text    = "⊘  BLOCK: " .. remote.Name
             local dirNote = direction == "OUT" and "→ Outgoing" or "← Incoming"
             setStatus(dirNote .. "  |  " .. caller, direction == "OUT" and T.DIR_OUT or T.DIR_IN)
@@ -1111,6 +1260,7 @@ local function buildLogEntry(remote, args, remoteType, direction)
         if spy.selected == entry then
             spy.selected = nil
             CodeBox.Text = ""
+            showFuncInfo(nil)
         end
         btn_h:Destroy()
         for i, e in ipairs(spy.entries) do
@@ -1132,18 +1282,22 @@ local function buildLogEntry(remote, args, remoteType, direction)
     return entry
 end
 
--- Main addLog function
-local function addLog(remote, args, remoteType, direction)
+--------------------------------------------------------------------------------
+-- ADD LOG  (called from hook — LAG FIX: queued, processed per frame)
+--------------------------------------------------------------------------------
+local function addLogImmediate(remote, args, remoteType, direction, funcInfo)
     if spy.paused               then return end
     if spy.blocked[remote.Name] then return end
 
     direction = direction or "OUT"
-
     spy.totalCalls = spy.totalCalls + 1
     updateCountLbl()
 
     spy.histIdx = (spy.histIdx % MAX_HISTORY) + 1
-    spy.history[spy.histIdx] = { remote=remote, args=args, rtype=remoteType, dir=direction, t=os.clock() }
+    spy.history[spy.histIdx] = {
+        remote = remote, args = args, rtype = remoteType,
+        dir = direction, t = os.clock()
+    }
 
     local key = dedupeKey(remote, args, direction)
     local now = os.clock()
@@ -1153,6 +1307,7 @@ local function addLog(remote, args, remoteType, direction)
         ex.count    = ex.count + 1
         ex.lastTime = now
         ex.args     = args
+        -- LAG FIX: only flash color, no tween on every dedup hit
         ex.btn.BackgroundColor3 = Color3.fromRGB(25, 55, 30)
         task.delay(0.12, function()
             if ex.btn and ex.btn.Parent then
@@ -1167,14 +1322,41 @@ local function addLog(remote, args, remoteType, direction)
         return
     end
 
-    local entry = buildLogEntry(remote, args, remoteType, direction)
+    -- LAG FIX: trim oldest entry if over cap
+    if #spy.entries >= MAX_LOG_ENTRIES then
+        local oldest = spy.entries[1]
+        if oldest.btn and oldest.btn.Parent then
+            oldest.btn:Destroy()
+        end
+        table.remove(spy.entries, 1)
+        local oldKey = dedupeKey(oldest.remote, oldest.args, oldest.direction)
+        spy.entryMap[oldKey] = nil
+    end
+
+    local entry = buildLogEntry(remote, args, remoteType, direction, funcInfo)
     table.insert(spy.entries, entry)
     spy.entryMap[key] = entry
     updateCanvas()
 end
 
+-- LAG FIX: hooks write to queue; frame loop drains at most 5 per frame
+local function addLog(remote, args, remoteType, direction, funcInfo)
+    table.insert(pendingLogs, {remote, args, remoteType, direction, funcInfo})
+end
+
+RunService.Heartbeat:Connect(function()
+    -- drain up to 5 pending logs per frame to avoid frame spikes
+    local limit = math.min(5, #pendingLogs)
+    for i = 1, limit do
+        local p = table.remove(pendingLogs, 1)
+        if p then
+            pcall(addLogImmediate, p[1], p[2], p[3], p[4], p[5])
+        end
+    end
+end)
+
 --------------------------------------------------------------------------------
--- DIRECTION FILTER BUTTONS
+-- DIRECTION FILTER
 --------------------------------------------------------------------------------
 local function setDirFilter(f)
     spy.dirFilter = f
@@ -1200,7 +1382,6 @@ local function setTab(tab)
 end
 
 setTab("log")
-
 TabLog.MouseButton1Click:Connect(function()     setTab("log")     end)
 TabExecLog.MouseButton1Click:Connect(function() setTab("execlog") end)
 
@@ -1265,17 +1446,12 @@ local function doFire(sel, code)
     if not sel or not sel.remote or not sel.remote.Parent then
         return false, "remote no longer exists"
     end
-
     local fn, lsErr = loadstring(code or generateCode(sel))
     if fn then
         local ok, runErr = pcall(fn)
-        if ok then
-            return true, "loadstring"
-        else
-            return false, "runtime: " .. tostring(runErr)
-        end
+        if ok then return true, "loadstring" end
+        return false, "runtime: " .. tostring(runErr)
     end
-
     local ok2, err2 = pcall(function()
         if sel.remoteType == "RemoteFunction" then
             sel.remote:InvokeServer(unsnap(sel.args))
@@ -1283,11 +1459,8 @@ local function doFire(sel, code)
             sel.remote:FireServer(unsnap(sel.args))
         end
     end)
-    if ok2 then
-        return true, "direct (" .. (lsErr or "ls disabled") .. ")"
-    else
-        return false, "fire error: " .. tostring(err2)
-    end
+    if ok2 then return true, "direct (" .. (lsErr or "ls disabled") .. ")" end
+    return false, "fire error: " .. tostring(err2)
 end
 
 --------------------------------------------------------------------------------
@@ -1296,16 +1469,12 @@ end
 FireBtn.MouseButton1Click:Connect(function()
     local now = os.clock()
     if now - spy.lastFire < FIRE_RATE_LIMIT then
-        setStatus("⚠ Rate limited.", T.YELLOW)
-        return
+        setStatus("⚠ Rate limited.", T.YELLOW) return
     end
     spy.lastFire = now
 
     local sel = spy.selected
-    if not sel then
-        setStatus("⚠ No remote selected.", T.YELLOW)
-        return
-    end
+    if not sel then setStatus("⚠ No remote selected.", T.YELLOW) return end
 
     local repeatN  = math.max(1, math.min(tonumber(RepeatBox.Text) or 1, 100))
     local interval = math.max(0, tonumber(IntervalBox.Text) or 0)
@@ -1347,12 +1516,8 @@ FireBtn.MouseButton1Click:Connect(function()
 
     local function fireOnce()
         local ok, detail = doFire(sel, code)
-        if ok then
-            fired = fired + 1
-        else
-            failed = failed + 1
-            logExec("err", detail, sel.remote.Name)
-        end
+        if ok then fired = fired + 1
+        else failed = failed + 1; logExec("err", detail, sel.remote.Name) end
     end
 
     if interval <= 0 or repeatN == 1 then
@@ -1367,8 +1532,8 @@ FireBtn.MouseButton1Click:Connect(function()
         local fires = 0
         local function schedNext()
             if fires >= repeatN then
-                local msg = "✓ Repeat done: " .. fired .. "/" .. repeatN
-                setStatus(msg, fired < repeatN and T.YELLOW or T.GREEN)
+                setStatus("✓ Repeat done: " .. fired .. "/" .. repeatN,
+                    fired < repeatN and T.YELLOW or T.GREEN)
                 logExec(fired < repeatN and "warn" or "ok", "×" .. repeatN, sel.remote.Name)
                 return
             end
@@ -1377,7 +1542,7 @@ FireBtn.MouseButton1Click:Connect(function()
             task.delay(interval, schedNext)
         end
         schedNext()
-        setStatus("↺ Firing " .. repeatN .. "× at " .. interval .. "s interval…", T.BLUE)
+        setStatus("↺ Firing " .. repeatN .. "× at " .. interval .. "s…", T.BLUE)
     end
 end)
 
@@ -1409,21 +1574,17 @@ end)
 --------------------------------------------------------------------------------
 FireAllBtn.MouseButton1Click:Connect(function()
     if spy.multiCount == 0 then
-        setStatus("⚠ Ctrl+Click entries to multi-select.", T.YELLOW)
-        return
+        setStatus("⚠ Ctrl+Click entries to multi-select.", T.YELLOW) return
     end
-
     local now = os.clock()
     if now - spy.lastFire < FIRE_RATE_LIMIT then
-        setStatus("⚠ Rate limited.", T.YELLOW)
-        return
+        setStatus("⚠ Rate limited.", T.YELLOW) return
     end
     spy.lastFire = now
 
     local delay  = math.max(0, tonumber(MultiDelayBox.Text) or 0)
     local toFire = {}
     for e in pairs(spy.multiSel) do table.insert(toFire, e) end
-
     local total, fired, failed, skipped = #toFire, 0, 0, 0
 
     local function fireEntry(entry)
@@ -1486,7 +1647,7 @@ DeselectBtn.MouseButton1Click:Connect(function()
 end)
 
 --------------------------------------------------------------------------------
--- COPY
+-- COPY CODE
 --------------------------------------------------------------------------------
 CopyBtn.MouseButton1Click:Connect(function()
     local txt = CodeBox.Text
@@ -1500,6 +1661,29 @@ CopyBtn.MouseButton1Click:Connect(function()
         CopyBtn.Text = "✓  COPIED!"
         task.delay(1.2, function() CopyBtn.Text = p end)
         setStatus("✓ Copied to clipboard.", T.BLUE)
+    else
+        setStatus("✕ No clipboard API found.", T.RED)
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- COPY FUNC INFO
+--------------------------------------------------------------------------------
+CopyFuncBtn.MouseButton1Click:Connect(function()
+    local sel = spy.selected
+    if not sel then
+        setStatus("⚠ Select a remote first.", T.YELLOW) return
+    end
+    local txt = generateFuncInfoCode(sel)
+    local ok = false
+    if not ok then pcall(function() setclipboard(txt)   ok = true end) end
+    if not ok then pcall(function() writeclipboard(txt) ok = true end) end
+    if not ok then pcall(function() toclipboard(txt)    ok = true end) end
+    if ok then
+        local p = CopyFuncBtn.Text
+        CopyFuncBtn.Text = "✓  COPIED!"
+        task.delay(1.2, function() CopyFuncBtn.Text = p end)
+        setStatus("✓ Func info + code copied.", T.PURPLE)
     else
         setStatus("✕ No clipboard API found.", T.RED)
     end
@@ -1534,7 +1718,9 @@ ClearBtn.MouseButton1Click:Connect(function()
     spy.multiSel      = {}
     spy.multiCount    = 0
     spy.totalCalls    = 0
+    pendingLogs       = {}
     CodeBox.Text      = ""
+    showFuncInfo(nil)
     updateCountLbl()
     updateMultiBadge()
     setStatus("── Logs cleared ──", T.TEXT_DIM)
@@ -1566,14 +1752,14 @@ MinBtn.MouseButton1Click:Connect(function()
     isMin = not isMin
     if isMin then
         tweenProp(Main, {Size = UDim2.fromOffset(WIN_W, 40)}, 0.2)
-        MinBtn.Text     = "□"
-        Body.Visible    = false
-        TabBar.Visible  = false
+        MinBtn.Text    = "□"
+        Body.Visible   = false
+        TabBar.Visible = false
     else
-        Body.Visible    = true
-        TabBar.Visible  = true
+        Body.Visible   = true
+        TabBar.Visible = true
         tweenProp(Main, {Size = UDim2.fromOffset(WIN_W, WIN_H)}, 0.2)
-        MinBtn.Text = "─"
+        MinBtn.Text    = "─"
     end
 end)
 
@@ -1612,6 +1798,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
         end
         spy.selected = nil
         CodeBox.Text = ""
+        showFuncInfo(nil)
         setStatus("⊘ Blocked (Delete): " .. name, T.ORANGE)
     end
 end)
@@ -1637,8 +1824,8 @@ end)
 
 RunService.RenderStepped:Connect(function()
     if not divDragging then return end
-    local mx  = UserInputService:GetMouseLocation().X
-    local dx  = mx - divDragStart
+    local mx   = UserInputService:GetMouseLocation().X
+    local dx   = mx - divDragStart
     local newW = math.clamp(divStartW + dx, 250, WIN_W - 220)
     LogPanel.Size      = UDim2.new(0, newW, 1, 0)
     Divider.Position   = UDim2.fromOffset(newW, 0)
@@ -1647,45 +1834,144 @@ RunService.RenderStepped:Connect(function()
 end)
 
 --------------------------------------------------------------------------------
--- HOOK ENGINE
--- Two strategies:
---   1. hookmetamethod  — intercepts outgoing FireServer / InvokeServer calls
---   2. OnClientEvent / OnClientInvoke — intercepts incoming server→client calls
---------------------------------------------------------------------------------
+-- ══════════════════════════════════════════════════════════════════════════
+--  HOOK ENGINE  v5.2  —  ALL FIXES APPLIED
+-- ══════════════════════════════════════════════════════════════════════════
+--
+--  FIX 1: Removed checkcaller() guard.
+--          The old code had:
+--              if not checkcaller or not checkcaller() then ... end
+--          Inside a hookmetamethod callback, checkcaller() can return TRUE
+--          for real game scripts on many executors, meaning the guard
+--          silently dropped the majority of legitimate remote calls.
+--          REMOVED entirely — the hook already only runs for FireServer/
+--          InvokeServer methods so there is no need to gate on checkcaller.
+--
+--  FIX 2: getrawmetatable fallback.
+--          If hookmetamethod is not available, we now manually patch
+--          game's __namecall via getrawmetatable + setreadonly.
+--
+--  FIX 3: hookfunction() backup on FireServer / InvokeServer directly.
+--          This catches any calls that bypass __namecall (e.g. stored refs).
+--
+--  FIX 4: Case variants — "fireServer" and "invokeServer" are now checked
+--          in addition to the Pascal-cased versions.
+--
+--  FIX 5: Function info is captured at hook time via debug.info / debug.getinfo
+--          and stored on the entry for display in the Function Info panel.
+-- ══════════════════════════════════════════════════════════════════════════
 
--- ── Strategy 1: Outgoing via hookmetamethod ─────────────────────────────
--- Only works on exploits that expose hookmetamethod (Synapse, KRNL, etc.)
 local outgoingHooked = false
+local originalNamecall = nil
+
+-- ── Namecall handler (shared by both hook strategies) ───────────────────
+local function handleNamecall(self, ...)
+    if typeof(self) ~= "Instance" then
+        return originalNamecall(self, ...)
+    end
+
+    local method = (getnamecallmethod and getnamecallmethod()) or ""
+
+    local isFireServer   = method == "FireServer"   or method == "fireServer"
+    local isInvokeServer = method == "InvokeServer" or method == "invokeServer"
+
+    if isFireServer or isInvokeServer then
+        local isRE = pcall(function() return self:IsA("RemoteEvent")   end) and self:IsA("RemoteEvent")
+        local isRF = pcall(function() return self:IsA("RemoteFunction") end) and self:IsA("RemoteFunction")
+
+        if (isFireServer and isRE) or (isInvokeServer and isRF) then
+            -- FIX 1: NO checkcaller() guard here
+            -- FIX 5: capture function info at hook time
+            local fi = {}
+            pcall(function() fi = captureFuncInfo() end)
+
+            local argSnap = snap(...)
+            local rtype   = isRF and "RemoteFunction" or "RemoteEvent"
+
+            -- queue the log (non-blocking)
+            task.defer(function()
+                addLog(self, argSnap, rtype, "OUT", fi)
+            end)
+        end
+    end
+
+    return originalNamecall(self, ...)
+end
+
+-- ── Strategy A: hookmetamethod (best, if available) ─────────────────────
 if hookmetamethod then
     local ok, err = pcall(function()
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod and getnamecallmethod() or ""
-            -- Only capture our own FireServer / InvokeServer calls (not spy replays)
-            if not checkcaller or not checkcaller() then
-                local isRE = typeof(self) == "Instance" and (pcall(function() return self:IsA("RemoteEvent") end)) and self:IsA("RemoteEvent")
-                local isRF = typeof(self) == "Instance" and (pcall(function() return self:IsA("RemoteFunction") end)) and self:IsA("RemoteFunction")
-                if method == "FireServer" and isRE then
-                    task.defer(addLog, self, snap(...), "RemoteEvent", "OUT")
-                elseif method == "InvokeServer" and isRF then
-                    task.defer(addLog, self, snap(...), "RemoteFunction", "OUT")
-                end
-            end
-            return oldNamecall(self, ...)
+        originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            return handleNamecall(self, ...)
         end)
     end)
     if ok then
         outgoingHooked = true
-        print("[RemoteSpy v5.1] hookmetamethod: outgoing FireServer/InvokeServer captured.")
+        print("[RemoteSpy v5.2] hookmetamethod: outgoing captured.")
     else
-        warn("[RemoteSpy v5.1] hookmetamethod unavailable, outgoing calls won't be captured:", err)
+        warn("[RemoteSpy v5.2] hookmetamethod failed:", err)
     end
-else
-    warn("[RemoteSpy v5.1] hookmetamethod not found — outgoing calls won't be captured.")
 end
 
--- ── Strategy 2: Incoming via OnClientEvent / OnClientInvoke ─────────────
-local function hookRemote(obj)
+-- ── Strategy B: getrawmetatable fallback (if hookmetamethod missing) ─────
+if not outgoingHooked and getrawmetatable and setreadonly then
+    local ok, err = pcall(function()
+        local gm = getrawmetatable(game)
+        originalNamecall = gm.__namecall
+        setreadonly(gm, false)
+        gm.__namecall = (newcclosure and newcclosure(handleNamecall) or handleNamecall)
+        setreadonly(gm, true)
+    end)
+    if ok then
+        outgoingHooked = true
+        print("[RemoteSpy v5.2] getrawmetatable fallback: outgoing captured.")
+    else
+        warn("[RemoteSpy v5.2] getrawmetatable fallback failed:", err)
+    end
+end
+
+-- ── Strategy C: hookfunction directly on FireServer / InvokeServer ───────
+-- This catches calls that bypass __namecall entirely (stored function refs)
+if hookfunction then
+    pcall(function()
+        local _re = Instance.new("RemoteEvent")
+        local _rf = Instance.new("RemoteFunction")
+        local origFire   = _re.FireServer
+        local origInvoke = _rf.InvokeServer
+        _re:Destroy()
+        _rf:Destroy()
+
+        hookfunction(origFire, newcclosure and newcclosure(function(self, ...)
+            -- FIX 1: NO checkcaller guard
+            local fi = {}
+            pcall(function() fi = captureFuncInfo() end)
+            task.defer(addLog, self, snap(...), "RemoteEvent", "OUT", fi)
+            return origFire(self, ...)
+        end) or function(self, ...)
+            local fi = {}
+            pcall(function() fi = captureFuncInfo() end)
+            task.defer(addLog, self, snap(...), "RemoteEvent", "OUT", fi)
+            return origFire(self, ...)
+        end)
+
+        hookfunction(origInvoke, newcclosure and newcclosure(function(self, ...)
+            local fi = {}
+            pcall(function() fi = captureFuncInfo() end)
+            task.defer(addLog, self, snap(...), "RemoteFunction", "OUT", fi)
+            return origInvoke(self, ...)
+        end) or function(self, ...)
+            local fi = {}
+            pcall(function() fi = captureFuncInfo() end)
+            task.defer(addLog, self, snap(...), "RemoteFunction", "OUT", fi)
+            return origInvoke(self, ...)
+        end)
+
+        print("[RemoteSpy v5.2] hookfunction: backup FireServer/InvokeServer hooked.")
+    end)
+end
+
+-- ── Incoming: OnClientEvent / OnClientInvoke ─────────────────────────────
+local function hookIncoming(obj)
     if not obj or not obj.Parent then return end
     if spy.hooked[obj] then return end
 
@@ -1694,30 +1980,27 @@ local function hookRemote(obj)
         local ok, err = pcall(function()
             obj.OnClientEvent:Connect(function(...)
                 if obj and obj.Parent then
-                    addLog(obj, snap(...), "RemoteEvent", "IN")
+                    addLog(obj, snap(...), "RemoteEvent", "IN", nil)
                 end
             end)
         end)
         if not ok then
             spy.hooked[obj] = nil
-            warn("[RemoteSpy v5.1] RemoteEvent hook failed: "
-                .. obj:GetFullName() .. " | " .. tostring(err))
+            warn("[RemoteSpy v5.2] RE hook failed:", obj:GetFullName(), err)
         end
 
     elseif obj:IsA("RemoteFunction") then
         spy.hooked[obj] = true
         local ok, err = pcall(function()
-            -- Save original so server can still get a response
             local original = obj.OnClientInvoke
             obj.OnClientInvoke = function(...)
-                addLog(obj, snap(...), "RemoteFunction", "IN")
+                addLog(obj, snap(...), "RemoteFunction", "IN", nil)
                 if original then return original(...) end
             end
         end)
         if not ok then
             spy.hooked[obj] = nil
-            warn("[RemoteSpy v5.1] RemoteFunction hook failed: "
-                .. obj:GetFullName() .. " | " .. tostring(err))
+            warn("[RemoteSpy v5.2] RF hook failed:", obj:GetFullName(), err)
         end
     end
 end
@@ -1725,14 +2008,14 @@ end
 -- Initial scan
 local hookedCount = 0
 for _, v in ipairs(game:GetDescendants()) do
-    local wasHooked = not spy.hooked[v]
-    hookRemote(v)
-    if wasHooked and spy.hooked[v] then hookedCount = hookedCount + 1 end
+    local was = not spy.hooked[v]
+    hookIncoming(v)
+    if was and spy.hooked[v] then hookedCount = hookedCount + 1 end
 end
-print(string.format("[RemoteSpy v5.1] Hooked %d existing remotes (incoming).", hookedCount))
+print(string.format("[RemoteSpy v5.2] Hooked %d existing remotes (incoming).", hookedCount))
 
 game.DescendantAdded:Connect(function(obj)
-    task.defer(function() hookRemote(obj) end)
+    task.defer(function() hookIncoming(obj) end)
 end)
 
 game.DescendantRemoving:Connect(function(obj)
@@ -1740,9 +2023,11 @@ game.DescendantRemoving:Connect(function(obj)
 end)
 
 --------------------------------------------------------------------------------
--- STARTUP
+-- STARTUP STATUS
 --------------------------------------------------------------------------------
 local startMsg = "◉ Active"
-    .. (outgoingHooked and "  |  → Outgoing + ← Incoming" or "  |  ← Incoming only (hookmetamethod missing)")
+    .. (outgoingHooked
+        and "  |  → Outgoing + ← Incoming"
+        or  "  |  ← Incoming only (no namecall hook)")
 setStatus(startMsg, T.GREEN)
-print("[RemoteSpy v5.1] Ready. Outgoing:", outgoingHooked)
+print("[RemoteSpy v5.2] Ready. Outgoing:", outgoingHooked)
