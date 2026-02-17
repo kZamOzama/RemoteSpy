@@ -1,5 +1,11 @@
 -- Holy Organize les goo
 
+--[[
+
+If it says hookmetamethod is missing that means that your executor is not supported
+
+]]--
+
 --------------------------------------------------------------------------------
 -- SERVICES
 --------------------------------------------------------------------------------
