@@ -1,17 +1,16 @@
--- Remote Spy v5.3 | Fixed Hook Engine + Function Info + Lag Fixes + Empty Args Fix
+
 --[[
-    FIXES IN v5.3:
-    [1] Removed checkcaller() guard — was silently dropping real game remote fires
-    [2] getrawmetatable fallback if hookmetamethod is missing
-    [3] hookfunction() backup on FireServer / InvokeServer directly
-    [4] Case variants handled: fireServer / invokeServer
-    [5] Function Info panel added (name, source, line, constants)
-    [6] Lag fixes: capped log entries, batched canvas updates,
-        deferred UI builds off main thread, pooled unused rows
-    [7] Empty args fix: generateCode emits no-arg call when n==0,
-        table.unpack replaces global unpack, doFire direct path
-        uses clean no-arg branch to avoid executor edge cases
-]]
+local obj = setmetatable({}, {
+    __namecall = function(self, ...)
+        print("__namecall triggered")
+    end
+})
+obj:SomeMethod() 
+
+Try running the script shown above!
+If it prints it works but if not then its your executor is not supported
+
+]]--
 
 --------------------------------------------------------------------------------
 -- SERVICES
