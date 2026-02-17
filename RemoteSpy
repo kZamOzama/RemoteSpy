@@ -1,14 +1,60 @@
 
 --[[
-local obj = setmetatable({}, {
-    __namecall = function(self, ...)
-        print("__namecall triggered")
+local results = {}
+
+local function check(name, fn)
+    results[name] = type(fn) == "function"
+end
+
+check("getrawmetatable", getrawmetatable)
+check("setreadonly", setreadonly)
+check("getnamecallmethod", getnamecallmethod)
+check("hookmetamethod", hookmetamethod)
+
+local namecallWorks = false
+
+local success, err = pcall(function()
+    local mt = getrawmetatable(game)
+    local old = mt.__namecall
+
+    setreadonly(mt, false)
+
+    mt.__namecall = function(self, ...)
+        local method = getnamecallmethod()
+        if method == "GetService" then
+            namecallWorks = true
+        end
+        return old(self, ...)
     end
-})
-obj:SomeMethod() 
+
+    setreadonly(mt, true)
+    game:GetService("Players")
+
+    -- restore original
+    setreadonly(mt, false)
+    mt.__namecall = old
+    setreadonly(mt, true)
+end)
+
+print("===== NAMECALL HOOK TEST =====")
+print("getrawmetatable  :", results["getrawmetatable"]  and "SUPPORTED" or "NOT SUPPORTED")
+print("setreadonly      :", results["setreadonly"]      and "SUPPORTED" or "NOT SUPPORTED")
+print("getnamecallmethod:", results["getnamecallmethod"] and "SUPPORTED" or "NOT SUPPORTED")
+print("hookmetamethod   :", results["hookmetamethod"]   and "SUPPORTED" or "NOT SUPPORTED")
+print("------------------------------")
+
+if not success then
+    print("Hook test FAILED  :", err)
+elseif namecallWorks then
+    print("Namecall hook     : FULLY SUPPORTED")
+else
+    print("Namecall hook     : NOT SUPPORTED (hook ran but method not caught)")
+end
+
+print("==============================")
 
 Try running the script shown above!
-If it prints it works but if not then its your executor is not supported
+
 
 ]]--
 
